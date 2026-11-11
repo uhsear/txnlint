@@ -53,6 +53,8 @@ PASS  an R6 message about an unlisted host does not print it, because it may be 
 ...
 PASS  UTF-16 without a BOM file exits 2 and names the cause, and does not report it clean  <-- pinned defect
 ...
+PASS  a bracket-quoted sp_executesql with a write or a variable is a note, not a clean run  <-- pinned defect
+...
 PASS  a string joined from literals is read as one, so a split verb is a note  <-- pinned defect
 PASS  a procedure run in a CATCH before the ROLLBACK is a note, and the safe shapes are not  <-- pinned defect
 ...
@@ -67,10 +69,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-212 assertions, 0 failed
+213 assertions, 0 failed
 ```
 
-The full run prints all 212 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 213 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -447,14 +449,13 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1113 statements and 452 branches, measured with
+- Branch coverage is 100 percent: 1114 statements and 452 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 212 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
-  3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
+- The self-test prints 213 assertions with 0 failed on every interpreter I ran in this round: Python 3.12.10
+  and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
-  removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
-  3.11.15 and 3.11.16 and printed the same count as the others.
+  removed, so there is no difference to explain.
 - Coverage was measured on Windows only. The Linux host has no `coverage` package.
 - I broke the new guard six ways in a scratch copy: no apostrophe at all, no guard on `message`, no guard on
   `path`, no `isinstance` test, no tab in the list, and a `csv.reader` call added to production code. The
@@ -529,9 +530,15 @@ to anything else. It prints the rule text with table names and, for R6, the name
   (`WITH c AS (...) DELETE FROM c`) is read as a delete of `c`, so it does not pair with an `INSERT` into the base table.
 - R5 counts only `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `TRUNCATE` as writes. A later batch that only runs `EXEC` of a
   procedure, DDL (`ALTER`, `DROP`, `CREATE`) or `SELECT ... INTO` is not reported.
-- Dynamic SQL run through a bracket-quoted `[sys].[sp_executesql]` is not recognised, so it gives no note. The
-  unbracketed forms do. An `EXEC` whose target is a variable (`EXEC @procname`) gives no note either, because the tool
-  cannot see which procedure runs.
+- Only a procedure named `sp_executesql` is read as dynamic SQL, bracket-quoted or not (`EXEC [dbo].[sp_executesql] N'...'`
+  gives the same note). Other procedures that run a string inside their own body (`sp_MSforeachtable 'DELETE FROM ?'`,
+  `xp_cmdshell 'sqlcmd -Q ...'`, `EXEC dbo.usp_x @sql = 'DELETE ...'`) give no note, and an `EXEC` whose target is a
+  variable (`EXEC @procname`) gives none either, because the tool cannot see which procedure runs.
+- R1 does not count a `MERGE ... WHEN NOT MATCHED THEN INSERT` as a refill, so `DELETE FROM t` followed by a `MERGE`
+  into `t` exits 0.
+- Run time grows sharply on pathological input. A chain of 3,000 `IF @x = n RAISERROR(...) ELSE` links took 46 seconds
+  in an audit run, and 30,000 nested `BEGIN` blocks took 62 seconds. Whole files are read into memory, about 1.2 seconds
+  per megabyte.
 - A `RAISERROR` with state 127 ends `sqlcmd`, and the `:EXIT` command also ends it. The tool models neither.
 - A non-breaking space between keywords is not whitespace to the tokenizer, so `DELETE<NBSP>FROM` is missed.
   SQL Server would not parse such a script.
@@ -572,6 +579,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
   because the tool does not run the code.
 - A double-quoted string, which is a string only when `QUOTED_IDENTIFIER` is off, is read as a name.
 - A subfolder that is reached only through a symbolic link is not followed, and its `.sql` files are skipped without a message.
+  The exit code does not warn about it, so a folder run can exit 0 without having read every script.
   A folder that holds only such a link exits 2 with `no .sql file found`.
 - Naming the same file twice, or a file and its folder, reads it twice and doubles the findings and the file count.
 - One unreadable file (a permission error or truncated UTF-16) stops the run with exit 2. It prints none of the
@@ -587,7 +595,6 @@ to anything else. It prints the rule text with table names and, for R6, the name
   code 3. This holds for a run with `--apply`.
 - A run that fails with exit 2 before it writes leaves an older `--out` file untouched. A caller that reads only the file
   sees the result of the previous run.
-- A header-only CSV does not mean clean, so check the exit code or the console note count.
 - Write the report outside the folder you scan, or give it a name that does not end in `.sql`. A report named
   `d/rep.sql` inside a scanned folder `d` is read as a script by the next run and counted as an extra file. Only the
   exact inputs of the current run are refused.

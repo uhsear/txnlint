@@ -544,14 +544,14 @@ def unread(toks):
             out.append((t.line, t.batch, ":r includes a file that is not read"))
         elif t.u in ("EXEC", "EXECUTE") and is_p(at(toks, k + 1), "("):
             body = [x for arg in paren_args(toks, k + 1)[0] for x in arg]
-        elif t.u == "SP_EXECUTESQL":
+        elif t.u == "SP_EXECUTESQL" or (t.kind == "i" and t.val.upper() == "SP_EXECUTESQL"):
             body = [at(toks, k + 1)]
             while is_p(at(toks, k + 1 + len(body)), "+"):
                 body += [at(toks, k + 1 + len(body)), at(toks, k + 2 + len(body))]
         text = plain_text(body)
         if body and (text is None or _WRITE_WORD.search(text)):
             out.append((t.line, t.batch, "%s runs a string that is not read, and it may "
-                        "hold a write" % t.u))
+                        "hold a write" % t.val.upper()))
     return out
 
 
@@ -1765,6 +1765,12 @@ def _run_checks(check, raises, tmp):
           and notes("EXEC sp_executesql @stmt, N'@a int', @a = 1") == [(1, "SP_EXECUTESQL")]
           and notes(S("SELECT 1;", "  :r other.sql")) == [(2, ":r")],
           "EXEC of a string with a write or a variable, sp_executesql and :r are listed as not read"
+          + PIN)
+    check(notes("EXEC [dbo].[sp_executesql] N'DELETE FROM dbo.t';") == [(1, "SP_EXECUTESQL")]
+          and notes("EXEC sys.[sp_executesql] N'update t set a = 1'") == [(1, "SP_EXECUTESQL")]
+          and notes("EXEC [sp_executesql] @stmt") == [(1, "SP_EXECUTESQL")]
+          and notes("EXEC [dbo].[sp_executesql] N'SELECT 1'") == [],
+          "a bracket-quoted sp_executesql with a write or a variable is a note, not a clean run"
           + PIN)
     got = analyse(S("EXEC('DELETE FROM dbo.T');", ":r a.sql"), "t.sql")[1]
     check([n.message for n in got] == [
