@@ -67,10 +67,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-209 assertions, 0 failed
+212 assertions, 0 failed
 ```
 
-The full run prints all 209 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 212 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -220,7 +220,8 @@ wrote findings.csv
 
 Some code cannot be read. `EXEC (@stmt)` runs a string that the tool does not see, and `:r` pulls in another
 file. When such code may hide a write, the tool prints a note. If it found nothing else, it exits with 3
-instead of 0, so a clean result never covers code it could not read.
+instead of 0. A clean result never covers an `EXEC` of a string or a `:r` that it could not read. It does not read a
+procedure body either, so a bare `EXEC dbo.usp_reload;` is clean (see Limits).
 
 For a file `dynamic.sql` that holds only `EXEC (@stmt);`:
 
@@ -446,10 +447,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1102 statements and 446 branches, measured with
+- Branch coverage is 100 percent: 1113 statements and 452 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 209 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 212 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
@@ -518,13 +519,19 @@ to anything else. It prints the rule text with table names and, for R6, the name
   not follow which statement threw, so that report is cautious, and the row is not lost in that case.
 - After `SET IMPLICIT_TRANSACTIONS ON` the tool treats every later write as inside a transaction, even after a
   `COMMIT`, so a `DELETE`, `COMMIT`, `INSERT` sequence is not reported.
-- Cross-database names match on their tail, so `DELETE FROM dbo.Lookup` and `INSERT INTO OtherDb.dbo.Lookup`
-  give an R1 finding for two different tables.
+- A database part decides R1 when the tool knows both databases. The database of an unqualified name is the one
+  in the last `USE` before it, so `USE ProdDb`, `DELETE FROM StagingDb.dbo.Lookup` and `INSERT INTO dbo.Lookup`
+  are two tables and give no finding. When no `USE` came first, or the `USE` names a variable the tool cannot
+  read, the tool cannot tell. It then reports `DELETE FROM dbo.Lookup` with `INSERT INTO OtherDb.dbo.Lookup`, so that
+  a refill is never missed. A `USE` in a file that you run after another one is not carried over.
 - A `THROW` in a `CATCH` block that sits inside an outer `TRY` is still counted as an R5 guard, although it jumps to the outer `CATCH`.
 - R1 does not treat a `MERGE` as a refill of a deleted table. A `DELETE` through a CTE name
   (`WITH c AS (...) DELETE FROM c`) is read as a delete of `c`, so it does not pair with an `INSERT` into the base table.
 - R5 counts only `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `TRUNCATE` as writes. A later batch that only runs `EXEC` of a
   procedure, DDL (`ALTER`, `DROP`, `CREATE`) or `SELECT ... INTO` is not reported.
+- Dynamic SQL run through a bracket-quoted `[sys].[sp_executesql]` is not recognised, so it gives no note. The
+  unbracketed forms do. An `EXEC` whose target is a variable (`EXEC @procname`) gives no note either, because the tool
+  cannot see which procedure runs.
 - A `RAISERROR` with state 127 ends `sqlcmd`, and the `:EXIT` command also ends it. The tool models neither.
 - A non-breaking space between keywords is not whitespace to the tokenizer, so `DELETE<NBSP>FROM` is missed.
   SQL Server would not parse such a script.
@@ -603,8 +610,12 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - The committed `LICENSE` uses LF like the other three files. A Windows checkout with `core.autocrlf=true` may show CRLF in the working tree. The license text and the copyright line are correct.
 - The guard on `message` is exercised only through `write_findings` with a synthetic finding. No real message can start
   with `=`, `+`, `-`, `@`, tab or carriage return, so no command-line case reaches that guard end to end.
+- A hostile file name from the command line is tested for `=`, `+`, `-` and `@` only. Tab and carriage return are
+  tested through `write_findings`, because Windows cannot create such file names.
 - The `isinstance` test inside the cell guard has no assertion of its own. Removing it turns the self-test red by a
   `TypeError` in the assertion list, not by a named assertion. `cell()` is called only with path and message strings.
+- A closed output pipe, or an `--out` path that holds a NUL character, ends in a Python traceback with exit 1, the same
+  code as "findings exist". Read the output, not only the exit code.
 - E0 exits 1, the same code as an ordinary finding. A caller must read the output to tell an unreadable file from a rule that fired.
 - An unexpected internal error exits 1 with a Python traceback, the same code as "findings exist". `main()` has no catch-all that maps a crash to its own code.
   A 20,000-program random token run in this round raised no exception. The driver is not in this repository, so you cannot repeat it from here.

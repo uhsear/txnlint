@@ -11,7 +11,7 @@ Linters that read one statement at a time cannot see these, because each
 statement is fine. The mistake is in how the statements sit between BEGIN,
 COMMIT, ROLLBACK, CATCH and GO. Other T-SQL linters exist and the README names
 them. Some follow BEGIN TRAN or XACT_ABORT across GO. None of the ones read
-has the four rules below. This is one standard-library file that has them, and
+on 2026-10-13 has the four rules below. This is one standard-library file that has them, and
 it says which line is wrong.
 
     python txnlint.py --self-test
@@ -35,7 +35,8 @@ E0 a quote or comment that is never closed. The rest of the file is unread.
 Nothing is written without --apply. Exit codes: 0 no finding, 1 at least one
 finding, 2 a file or folder could not be read or the report could not be
 written, 3 no finding but some code was not read (EXEC of a string that may
-hold a write, sp_executesql, :r), 64 usage error.
+hold a write, sp_executesql, :r, or EXEC of a procedure after an unprotected
+DELETE or TRUNCATE or in a CATCH block before its ROLLBACK), 64 usage error.
 """
 
 from __future__ import print_function
@@ -633,6 +634,8 @@ def scan(toks):
                 for a, b in skipped_branches(toks, k, stack, ends):
                     shield_on.setdefault(a, []).append(k)
                     shield_off.setdefault(b, []).append(k)
+        elif t.u == "USE" and nxt.u not in ("HINT", "PLAN"):
+            add("use", nxt.val.lower() if nxt.kind in ("w", "i") else "")
         elif t.u == "SET":
             if nxt.u in ("XACT_ABORT", "IMPLICIT_TRANSACTIONS") and \
                     at(toks, k + 2).u in ("ON", "OFF"):
@@ -683,9 +686,18 @@ def is_scratch(name):
     return name.startswith(("#", "@"))
 
 
-def same_table(a, b):
-    """True when the shorter dotted name is the tail of the longer one."""
+def same_table(a, b, db_a="", db_b=""):
+    """True when the shorter dotted name is the tail of the longer one.
+
+    A database part that both sides know and that differs means two tables. A side
+    with no database part runs in db_a or db_b, the database of the last USE before
+    it. When that is unknown, the tool cannot tell and reports the pair.
+    """
     pa, pb = a.split("."), b.split(".")
+    da = pa[-3] if len(pa) > 2 else db_a
+    db = pb[-3] if len(pb) > 2 else db_b
+    if da and db and da != db:
+        return False
     m = min(len(pa), len(pb))
     return pa[len(pa) - m:] == pb[len(pb) - m:]
 
@@ -711,17 +723,19 @@ def walk(evs):
 
 def rule_r1(evs):
     """A DELETE or TRUNCATE outside a transaction, then an INSERT into the same table."""
-    exposed, inserts, out = [], [], []
+    exposed, inserts, out, db = [], [], [], ""
     for pos, (e, in_tran) in enumerate(walk(evs)):
+        if e.kind == "use":
+            db = e.name
         if e.kind != "write" or not e.name:
             continue
         if e.extra in ("DELETE", "TRUNCATE") and not in_tran and not is_scratch(e.name):
-            exposed.append((pos, e))
+            exposed.append((pos, e, db))
         elif e.extra == "INSERT":
-            inserts.append((pos, e))
-    for pos, d in exposed:
-        for ipos, ins in inserts:
-            if ipos > pos and same_table(d.name, ins.name):
+            inserts.append((pos, e, db))
+    for pos, d, ddb in exposed:
+        for ipos, ins, idb in inserts:
+            if ipos > pos and same_table(d.name, ins.name, ddb, idb):
                 where = "" if ins.batch == d.batch else " (batch %d)" % ins.batch
                 out.append((d.line, d.batch,
                             "%s %s runs outside a transaction and commits by itself. "
@@ -1235,6 +1249,28 @@ def _run_checks(check, raises, tmp):
           and lint(S("DELETE FROM Lookup;", "INSERT INTO dbo.Lookup SELECT 1;")) == [("R1", 1)]
           and lint(S("DELETE FROM dbo.Lookup;", "INSERT INTO other.Lookup SELECT 1;")) == [],
           "table names match on their tail, ignoring case and brackets, and not across schemas")
+    check(lint(S("USE [ProdDb];", "GO", "DELETE FROM StagingDb.dbo.Lookup;", "GO",
+                 "INSERT INTO dbo.Lookup (code) SELECT code FROM StagingDb.dbo.Lookup;", "GO")) == []
+          and lint(S("DELETE FROM A.dbo.Lookup;", "INSERT INTO B.dbo.Lookup SELECT 1;")) == [],
+          "a delete in another database than the current one is not a refill of this table" + PIN)
+    check(lint(S("USE ProdDb;", "DELETE FROM ProdDb.dbo.Lookup;", "INSERT INTO dbo.Lookup SELECT 1;"))
+          == [("R1", 2)]
+          and lint(S("USE ProdDb;", "DELETE FROM dbo.Lookup;",
+                     "INSERT INTO ProdDb.dbo.Lookup SELECT 1;")) == [("R1", 2)]
+          and lint(S("USE Other;", "USE ProdDb;", "DELETE FROM Other.dbo.Lookup;",
+                     "INSERT INTO dbo.Lookup SELECT 1;")) == []
+          and lint(S("USE Other;", "USE ProdDb;", "DELETE FROM ProdDb.dbo.Lookup;",
+                     "INSERT INTO dbo.Lookup SELECT 1;")) == [("R1", 3)],
+          "the database of the last USE decides which side a qualified name is")
+    check(lint(S("DELETE FROM Db.dbo.Lookup;", "INSERT INTO dbo.Lookup SELECT 1;")) == [("R1", 1)]
+          and lint(S("USE $(Db);", "DELETE FROM $(Db).dbo.Lookup;",
+                     "INSERT INTO dbo.Lookup SELECT 1;")) == [("R1", 2)]
+          and lint(S("USE ProdDb;", "USE;", "DELETE FROM Db.dbo.Lookup;",
+                     "INSERT INTO dbo.Lookup SELECT 1;")) == [("R1", 3)]
+          and lint(S("USE ProdDb;", "SELECT 1 OPTION (USE HINT ('X'));",
+                     "SELECT 1 OPTION (USE PLAN N'p');", "DELETE FROM ProdDb.dbo.Lookup;",
+                     "INSERT INTO dbo.Lookup SELECT 1;")) == [("R1", 4)],
+          "with the current database unknown the pair is still reported, and USE HINT is no USE")
     found = lint_text(S(PAIR.split("\n")[0], "GO", PAIR.split("\n")[1], "GO"))
     check([(f.rule, f.line, f.batch) for f in found] == [("R1", 1, 1)]
           and "(batch 2)" in found[0].message,
