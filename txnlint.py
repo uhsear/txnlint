@@ -91,6 +91,7 @@ _STMT_WORDS = frozenset(["SELECT", "SET", "DECLARE", "EXEC", "EXECUTE", "PRINT",
 _MODULES = frozenset(["PROC", "PROCEDURE", "FUNCTION", "TRIGGER"])
 _WRITES = frozenset(["INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE"])
 _TRAN_WORDS = ("TRAN", "TRANSACTION")
+_EXITS = ("RETURN", "GOTO", "THROW")
 _TRAN_BEGIN = _TRAN_WORDS + ("DISTRIBUTED",)
 # These words end a DELETE or UPDATE that has no semicolon, when we look for its alias.
 _STOP = frozenset(["IF", "WHILE", "BEGIN", "END", "DECLARE", "EXEC", "EXECUTE", "PRINT",
@@ -356,12 +357,13 @@ def governed_by_if(toks, k):
     return False
 
 
-def leaves_batch(toks, k):
-    """True when RAISERROR at k is followed by an unconditional RETURN or GOTO before any write.
+def leaves_batch(toks, k, words=("RETURN", "GOTO"), stop_at_write=True):
+    """True when the statement at k is followed by an unconditional word in `words`.
 
     RAISERROR does not end a batch, so without this the statements after it still run.
-    The search stays inside the block that holds the RAISERROR. A RETURN that is the
+    The search stays inside the block that holds the statement. A RETURN that is the
     body of an IF does not count, because it runs only when the condition is true.
+    A write before the exit ends the search unless stop_at_write is False.
     """
     depth = 0
     for j in range(k + 1, len(toks)):
@@ -374,9 +376,9 @@ def leaves_batch(toks, k):
             depth -= 1
             if depth < 0:
                 return False
-        elif depth == 0 and t.u in ("RETURN", "GOTO") and not governed_by_if(toks, j):
+        elif depth == 0 and t.u in words and not governed_by_if(toks, j):
             return True
-        elif t.u in _WRITES and is_statement_start(toks, j):
+        elif stop_at_write and t.u in _WRITES and is_statement_start(toks, j):
             return False
     return False
 
@@ -452,11 +454,16 @@ def scan(toks):
         elif t.u == "COMMIT":
             add("commit")
         elif t.u == "ROLLBACK":
-            # extra is True when the ROLLBACK is conditional: the early-exit idiom
+            # extra is True when the ROLLBACK is conditional and its branch then leaves:
             # IF cond BEGIN ROLLBACK; RETURN; END must not end the transaction for the
             # statements after it, because they are reached only when cond is false.
-            add("rollback", at(toks, k + 2).val.lower() if nxt.u in _TRAN_WORDS else "",
-                "cblock" in stack or governed_by_if(toks, k))
+            # A conditional ROLLBACK with no exit leaves the code after it reachable
+            # both ways, so it ends the transaction on the path that rolled back.
+            cond = governed_by_if(toks, k)
+            leaves = False
+            if cond or "cblock" in stack:
+                leaves = leaves_batch(toks, k, _EXITS, cond or stack[-1] != "cblock")
+            add("rollback", at(toks, k + 2).val.lower() if nxt.u in _TRAN_WORDS else "", leaves)
         elif t.u == "SAVE" and nxt.u in _TRAN_WORDS:
             add("save", at(toks, k + 2).val.lower())
         elif t.u == "XACT_STATE":
@@ -1086,13 +1093,30 @@ def _run_checks(check, raises, tmp):
                      "IF @x = 0 BEGIN ROLLBACK; RETURN; END", PAIR, "COMMIT;", "END")) == [],
           "a ROLLBACK in an early-exit branch does not end the transaction for the code after it"
           + PIN)
-    check(lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 ROLLBACK TRAN", PAIR)) == []
-          and lint(S("BEGIN TRAN;", "IF @x = 1 PRINT 1", "ELSE", "ROLLBACK;", PAIR)) == []
-          and lint(S("BEGIN TRAN;", "IF (SELECT 1) = 1 ROLLBACK;", PAIR)) == []
-          and lint(S("BEGIN TRAN;", "IF UPDATE(a) ROLLBACK;", PAIR)) == []
+    check(lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 ROLLBACK TRAN", PAIR)) == [("R1", 3)]
+          and lint(S("BEGIN TRAN;", "IF @x = 1 PRINT 1", "ELSE", "ROLLBACK;", PAIR)) == [("R1", 5)]
+          and lint(S("BEGIN TRAN;", "IF (SELECT 1) = 1 ROLLBACK;", PAIR)) == [("R1", 3)]
+          and lint(S("BEGIN TRAN;", "IF UPDATE(a) ROLLBACK;", PAIR)) == [("R1", 3)]
           and lint(S("BEGIN TRAN;", "WHILE @i < 3 BEGIN", "SET @i = @i + 1;", "ROLLBACK;",
-                     "END", PAIR)) == [],
-          "a ROLLBACK under IF, ELSE or WHILE, with or without BEGIN, is conditional")
+                     "END", PAIR)) == [("R1", 6)]
+          and lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 BEGIN", "ROLLBACK;", "PRINT 'x';", "END",
+                     PAIR, "COMMIT;")) == [("R1", 6)]
+          and lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 ROLLBACK TRAN;", PAIR, "COMMIT;",
+                     "RETURN 0;")) == [("R1", 3)],
+          "a ROLLBACK under IF, ELSE or WHILE with no exit still ends the transaction on the "
+          "path that rolled back, so the writes after it can run outside one" + PIN)
+    check(lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 BEGIN", "ROLLBACK;", "THROW 50000, 'x', 1;",
+                 "END", PAIR, "COMMIT;")) == []
+          and lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 BEGIN", "ROLLBACK;",
+                     "INSERT INTO dbo.Log VALUES (1);", "RETURN;", "END", PAIR, "COMMIT;")) == []
+          and lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 BEGIN", "ROLLBACK;", "GOTO done;", "END",
+                     PAIR, "COMMIT;", "done:")) == []
+          and lint(S("BEGIN TRAN;", "IF @a = 1 BEGIN", "IF @@ERROR <> 0 ROLLBACK;", "RETURN;",
+                     "END", PAIR, "COMMIT;")) == []
+          and lint(S("BEGIN TRAN;", "IF @@ERROR <> 0 BEGIN", "ROLLBACK;", "IF @y = 1 RETURN;",
+                     "END", PAIR, "COMMIT;")) == [("R1", 6)],
+          "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN leaves the "
+          "transaction open for the code after it, even with a write before the exit")
     check(lint(S("ROLLBACK;", PAIR)) == [("R1", 2)]
           and lint(S("IF @x = 1", "GO", "ROLLBACK;", PAIR)) == [("R1", 4)]
           and lint(S("BEGIN TRAN;", "UPDATE dbo.A SET x = 1 ROLLBACK;", PAIR)) == [("R1", 3)]
@@ -1101,7 +1125,10 @@ def _run_checks(check, raises, tmp):
                      "END")) == [("R1", 5)],
           "a ROLLBACK that nothing makes conditional still ends the transaction, "
           "even inside a procedure body")
-    check(lint(S("BEGIN TRAN;", "IF (SELECT 1 WHERE 1 = (SELECT 2)) = 1 ROLLBACK;", PAIR)) == []
+    check(lint(S("BEGIN TRAN;", "IF (SELECT 1 WHERE 1 = (SELECT 2)) = 1 ROLLBACK;", PAIR))
+          == [("R1", 3)]
+          and lint(S("BEGIN TRAN;", "IF (SELECT 1 WHERE 1 = (SELECT 2)) = 1 ROLLBACK;",
+                     "RETURN;", PAIR)) == []
           and lint(S("BEGIN TRAN;", "IF @x = 1 SELECT (1) ROLLBACK;", PAIR)) == [("R1", 3)]
           and lint(S("BEGIN DISTRIBUTED TRAN x;", "ROLLBACK TRAN x;", PAIR)) == [("R1", 3)],
           "a nested condition is skipped whole, and only the body of an IF is conditional")

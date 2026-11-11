@@ -55,10 +55,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-186 assertions, 0 failed
+187 assertions, 0 failed
 ```
 
-The full run prints all 186 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 187 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -234,7 +234,8 @@ $ echo $?
 The parser does not accept abbreviations. `--ap` is refused with exit code 64, and it writes nothing,
 even next to `--out`. Argparse would otherwise read `--ap` as `--apply`.
 
-`--out` may not name a file that the same run reads. The tool refuses, so a typo cannot overwrite a script.
+`--out` may not name a file that the same run reads, by any path that resolves to that same file. The tool refuses,
+so a typo cannot overwrite a script. A hard link to an input is not detected (see Limits).
 
 ## The rules
 
@@ -249,9 +250,12 @@ between `BEGIN TRANSACTION` and `COMMIT`. The tool matches table names by their 
 brackets. It ignores temp tables and table variables. It follows an alias, so `DELETE b FROM dbo.Helper b JOIN ...`
 is a `DELETE` of `dbo.Helper`. It reads a table name that starts with a sqlcmd variable, such as `$(Schema).Lookup`, so a `DELETE` and an
 `INSERT` that name it are paired. A `ROLLBACK` that sits under `IF`, `ELSE` or `WHILE`, or in a `BEGIN`/`END` block that one of
-them controls, does not end the transaction for the code after it. That keeps the early-exit idiom
+them controls, does not end the transaction for the code after it only when its branch then leaves with an
+unconditional `RETURN`, `GOTO` or `THROW`. That keeps the early-exit idiom
 `IF @@ERROR <> 0 BEGIN ROLLBACK TRAN RETURN END` from hiding the pair that follows it. Any other `ROLLBACK`
-ends the transaction.
+ends the transaction, including `IF @@ERROR <> 0 ROLLBACK TRAN` with no exit: the code after it also runs on the
+path that rolled back, outside any transaction, so a `DELETE` and `INSERT` there are reported. R1 does not report a
+`DELETE` or `TRUNCATE` of a temp table or table variable.
 
 **R2. `SET XACT_ABORT ON`, with two or more writes outside any transaction.** `XACT_ABORT` rolls back
 the transaction that a run-time error finds. With no open transaction, each write has already committed.
@@ -383,7 +387,7 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A write straight after `SET ... ON` is a statement even with no semicolon | "a write straight after SET ... ON", "a bare pair straight after SET ... ON", "R2 counts writes that follow SET XACT_ABORT ON" |
 | A sqlcmd `$(variable)` is part of a name | "a sqlcmd $(variable) is part of a name", "a table named through a sqlcmd variable" |
 | R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs" |
-| A conditional `ROLLBACK` does not end the transaction, and any other one does | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
+| A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
 | R2 sees `XACT_ABORT` across `GO` and ignores scratch tables | "SET XACT_ABORT ON with two bare writes", "XACT_ABORT set in one batch", "inside a procedure only its own SET counts", "scratch writes do not count", "R2 points at the SET", "R2 lists five lines" |
 | R3 reports a write before the `ROLLBACK`, and spares the safe shapes | "a log INSERT in CATCH", "the same CATCH with the ROLLBACK first", "a table variable survives ROLLBACK", "a CATCH that tests XACT_STATE", "a write before the XACT_STATE test", "a CATCH that commits and never rolls back", "a stray END TRY opens no transaction" |
@@ -405,14 +409,14 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | The harness can fail | the two `pinned defect` probes of `check()`, `raises()` and the footer |
 
 There is no network code in this tool, so there is no stub server. It opens no connection to SQL Server or
-to anything else. It prints the rule text with table and host names. It does not print string contents.
+to anything else. It prints the rule text with table and host names. It does not print string contents, except the host name that R6 reads out of a UNC path (see Limits).
 
 ## Measured
 
-- Branch coverage is 100 percent: 963 statements and 378 branches, measured with
+- Branch coverage is 100 percent: 969 statements and 380 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 186 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 187 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
@@ -427,8 +431,8 @@ to anything else. It prints the rule text with table and host names. It does not
   that cannot be zero, or changes only the wording of an error message. An earlier sweep of 437 mutations of
   an earlier version left 45; the real gaps it showed are pinned by assertions. The sweep script is not part of
   this repository, so you cannot repeat the sweep from here.
-- 60,000 random programs made of T-SQL keywords, quotes, sqlcmd lines and odd characters ran through the core
-  with no exception.
+- 20,000 random programs made of T-SQL keywords, quotes, sqlcmd lines and odd characters ran through the core
+  with no exception, in 1.2 seconds on Windows. The driver is not part of this repository, so you cannot repeat the run from here.
 - Run once by hand on Linux as an ordinary user: a subfolder with mode 000 gives `Permission denied` and exit 2
   instead of a clean pass; `ln victim.sql hl.sql` followed by `--out hl.sql --apply` overwrites `victim.sql`
   with the CSV (listed under Limits); a folder reached only through a symbolic link gives exit 2, and a
@@ -466,8 +470,9 @@ to anything else. It prints the rule text with table and host names. It does not
 - R5 cannot know how you run the script. If you always use `sqlcmd -b`, leave R5 out with `--rules`.
 - An alias is resolved from the `FROM` or `JOIN` of the same statement. A derived table keeps the alias as its name.
 - A savepoint is recognised by its name from `SAVE TRAN`. `ROLLBACK TRAN name` with any other name is a full rollback.
-- A `ROLLBACK` under `IF`, `ELSE` or `WHILE` is read as not ending the transaction. If it did end it, a `DELETE` and
-  `INSERT` after it are not reported.
+- A `ROLLBACK` under `IF`, `ELSE` or `WHILE` is read as leaving the transaction open only when its branch ends in an
+  unconditional `RETURN`, `GOTO` or `THROW`. A `RETURN` that is itself under an `IF` does not count, so the code after
+  it is read as outside the transaction. The tool does not follow a `GOTO` to its label.
 - A `RAISERROR` counts as a guard that stops the code after it only if a `RETURN` or `GOTO` follows in the same
   block before any write. A script that sets a flag and tests the flag later is reported anyway.
 - After `SET IMPLICIT_TRANSACTIONS ON` the tool treats every later write as inside a transaction, even after a
@@ -484,6 +489,13 @@ to anything else. It prints the rule text with table and host names. It does not
   SQL Server would not parse such a script.
 - R1 compares every unprotected `DELETE` with every later `INSERT`. A script with 4000 `DELETE`s and 4000 `INSERT`s on
   different tables took about 10 seconds in my run.
+- R6 prints the name that follows a double backslash in a string, so a password written in that position
+  (`'Pwd=\\hunter2\x'`) would reach the report and the CSV. Nothing else in a string is printed.
+- R6 needs a backslash after the host, so `'\\rogue'` with no share is not read, even when `rogue` is not listed.
+- R2 and R5 skip a write to a temp table (`#name`) or table variable (`@name`). A guard followed by `INSERT INTO #stage`
+  in a later batch is not reported, although that write runs.
+- A single batch with thousands of `RAISERROR` statements and no write after them is slow, because each one rescans
+  the rest of its batch. 2000 of them (42 KB) took 4.8 seconds in my run, and 4000 took about 20 seconds in an audit run.
 - R6 reads each string literal on its own, so a UNC path split across a concatenation (`N'\\host' + N'\share'`) is not seen.
 - R6 does not flag a listed host written with no leading backslash (`host\share`), because that looks like `server\instance`.
 - R6 matches a listed host exactly or as the first label of a longer name. A listed `backupsrv` therefore also accepts
@@ -536,6 +548,11 @@ to anything else. It prints the rule text with table and host names. It does not
 - `safe()` rewrites a non-ASCII path with backslash escapes in the report and in the CSV, so the printed path may not match the real file name.
 - `safe()` escapes only non-ASCII characters. A table, alias or file name that holds a control character or an escape sequence is printed raw,
   so a hostile `.sql` file can put terminal escape codes or fake lines into the report.
+- `LICENSE` is stored with CRLF line endings and the other three files use LF. The license text and the copyright line are correct.
+- The guard on `message` is exercised only through `write_findings` with a synthetic finding. No real message can start
+  with `=`, `+`, `-`, `@`, tab or carriage return, so no command-line case reaches that guard end to end.
+- The `isinstance` test inside the cell guard has no assertion of its own. Removing it turns the self-test red by a
+  `TypeError` in the assertion list, not by a named assertion. `cell()` is called only with path and message strings.
 - E0 exits 1, the same code as an ordinary finding. A caller must read the output to tell an unreadable file from a rule that fired.
 - An unexpected internal error exits 1 with a Python traceback, the same code as "findings exist". `main()` has no catch-all that maps a crash to its own code.
 
