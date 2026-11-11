@@ -477,6 +477,8 @@ def scan(toks):
                 j += 2
             if not (t.u == "ALTER" and at(toks, k - 1).u == "OR") and at(toks, j).u in _MODULES:
                 add("module")
+        elif t.u in ("EXEC", "EXECUTE") and nxt.u not in ("", "AS", "SP_EXECUTESQL")                 and not is_p(nxt, "(") and at(toks, k - 1).u not in _NOT_AFTER:
+            add("exec")
         elif t.u in _WRITES and is_statement_start(toks, k):
             add("write", write_target(toks, k), t.u)
     # ROLLBACK TRAN name undoes only part of a transaction when name is a savepoint.
@@ -674,11 +676,13 @@ def rule_r6(toks, hosts):
             continue
         for m in _UNC_RE.finditer(t.val):
             count, host = len(m.group(1)), m.group(2).lower()
-            if host in hosts and count not in (0, 2):
+            # A listed short name also covers its fully qualified form.
+            listed = host in hosts or any(host.startswith(h + ".") for h in hosts)
+            if listed and count not in (0, 2):
                 out.append((t.line, t.batch,
                             "a path to host %s starts with %d backslash(es). A UNC path "
                             "starts with exactly 2." % (safe(host), count)))
-            elif host not in hosts and count == 2:
+            elif not listed and count == 2:
                 out.append((t.line, t.batch,
                             "a UNC path names host %s, which is not on the --unc-host list."
                             % safe(host)))
@@ -691,6 +695,25 @@ _RULE_FUNCS = (("R1", rule_r1), ("R2", rule_r2), ("R3", rule_r3), ("R5", rule_r5
 def lint_text(text, path="<text>", rules=DEFAULT_RULES, hosts=()):
     """Every finding in one script, sorted by line. Pure: no file, no output."""
     return analyse(text, path, rules, hosts)[0]
+
+
+def exec_after_delete(evs):
+    """A procedure run after a DELETE or TRUNCATE outside a transaction: (line, batch, message).
+
+    The procedure body is another script and may refill the table, so a clean result
+    would be a guess. One note per EXEC, naming the first exposed delete before it.
+    """
+    exposed, out = [], []
+    for e, in_tran in walk(evs):
+        if e.kind == "write" and e.name and e.extra in ("DELETE", "TRUNCATE")                 and not in_tran and not is_scratch(e.name):
+            exposed.append(e)
+        elif e.kind == "exec" and exposed:
+            d = exposed[0]
+            out.append((e.line, e.batch,
+                        "EXEC runs a procedure that is not read, after %s %s at line %d "
+                        "outside a transaction. It may refill the table."
+                        % (_VERB_FORM[d.extra], safe(d.name), d.line)))
+    return out
 
 
 def analyse(text, path="<text>", rules=DEFAULT_RULES, hosts=()):
@@ -706,7 +729,12 @@ def analyse(text, path="<text>", rules=DEFAULT_RULES, hosts=()):
         out += [Finding(path, ln, b, "R6", msg)
                 for ln, b, msg in rule_r6(toks, frozenset(hosts))]
     # R6 reads every string literal itself, so a note matters only to the other rules.
-    notes = [Finding(path, ln, b, "note", msg) for ln, b, msg in unread(toks)]         if set(rules) & set(DEFAULT_RULES) else []
+    notes = []
+    if set(rules) & set(DEFAULT_RULES):
+        found = unread(toks)
+        for _, uevs in units(evs):
+            found += exec_after_delete(uevs)
+        notes = [Finding(path, ln, b, "note", msg) for ln, b, msg in sorted(found)]
     return sorted(out, key=lambda f: (f.line, f.rule, f.message)), notes
 
 
@@ -1348,6 +1376,11 @@ def _run_checks(check, raises, tmp):
     check(r6(q(unc(2, "otherhost"))) == [("R6", 1)] and r6(q(unc(2, "10.0.0.5"))) == [("R6", 1)]
           and r6(q(unc(1, "otherhost"))) == [],
           "a two-backslash path to an unlisted host is R6, and a one-backslash path to one is not")
+    check(r6(q(unc(2, "backupsrv.corp.example"))) == []
+          and r6(q(unc(1, "backupsrv.corp.example"))) == [("R6", 1)]
+          and r6(q(unc(2, "backupsrv2.corp.example"))) == [("R6", 1)]
+          and r6(q(unc(2, "BackupSrv.Corp.Example"))) == [],
+          "a listed short host also covers its fully qualified name, and a longer name does not" + PIN)
     check(r6("SELECT [" + unc(1, "backupsrv") + "], " + unc(1, "backupsrv")) == [],
           "a bracketed name or a bare word is not a string, so it is not read as a path")
     check(r6("-- " + q(unc(1, "backupsrv")) + "\n/* " + unc(1, "backupsrv") + " */") == [],
@@ -1385,6 +1418,25 @@ def _run_checks(check, raises, tmp):
           and notes("EXEC sp_executesql") == [] and notes("EXEC('SELECT ' + 'x')") == []
           and notes("EXEC('DELETE FROM t'); :r a.sql", ("R6",)) == [],
           "a procedure call, a harmless string and a run with only R6 list nothing")
+    check(notes(S("DELETE FROM dbo.Lookup;", "GO", "EXEC dbo.Refill;")) == [(3, "EXEC")]
+          and notes(S("TRUNCATE TABLE dbo.Lookup", "EXEC dbo.Refill")) == [(2, "EXEC")]
+          and notes(S("DELETE FROM dbo.Lookup;", "EXECUTE @rc = dbo.Refill;")) == [(2, "EXEC")]
+          and notes(S("DELETE FROM dbo.Lookup;", "EXEC dbo.A;", "EXEC dbo.B;"))
+          == [(2, "EXEC"), (3, "EXEC")]
+          and gate([], analyse(S("DELETE FROM dbo.Lookup;", "EXEC dbo.Refill;"), "t.sql")[1]) == 3,
+          "a procedure run after an unprotected DELETE or TRUNCATE is a note, so a clean result is not a guess"
+          + PIN)
+    check(notes(S("EXEC dbo.Refill;", "DELETE FROM dbo.Lookup;")) == []
+          and notes(S("BEGIN TRANSACTION;", "DELETE FROM dbo.Lookup;", "EXEC dbo.Refill;", "COMMIT;"))
+          == []
+          and notes(S("DELETE FROM #tmp;", "EXEC dbo.Refill;")) == []
+          and notes(S("DELETE FROM dbo.Lookup;", "GRANT EXECUTE ON dbo.p TO u;")) == []
+          and notes(S("DELETE FROM dbo.Lookup;", "EXECUTE AS USER = N'x';")) == []
+          and notes(S("DELETE FROM dbo.Lookup;", "EXEC sp_executesql N'SELECT 1'")) == []
+          and notes(S("DELETE FROM dbo.Lookup;", "EXEC")) == []
+          and notes(S("DELETE FROM dbo.Lookup;", "EXEC dbo.Refill;"), ("R6",)) == [],
+          "no note for a procedure before the delete, inside a transaction, on a temp table, "
+          "a grant, EXECUTE AS, sp_executesql or a run with only R6")
     check(gate([], []) == 0 and gate([], [1]) == 3 and gate([1], [1]) == 1 and gate([1]) == 1,
           "the gate gives 3 for notes alone, and a finding still gives 1")
 
@@ -1565,7 +1617,7 @@ def _run_checks(check, raises, tmp):
     everything = out + err + slurp(csv_path)
     check(code == 1 and ":1: R6 " in out and "rules R1 R2 R3 R5 R6" in out
           and "hunter2" not in everything and "secret" not in everything,
-          "--unc-host turns R6 on, and no part of the path reaches the output or the CSV")
+          "--unc-host turns R6 on, and nothing after the host name reaches the output or the CSV")
     odd = put("odd.sql", "",
               ("DELETE FROM [t" + chr(233) + "st]\nINSERT INTO [t" + chr(233)
                + "st] SELECT 1").encode("utf-8"))

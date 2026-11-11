@@ -55,10 +55,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-183 assertions, 0 failed
+186 assertions, 0 failed
 ```
 
-The full run prints all 183 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 186 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -121,8 +121,9 @@ python txnlint.py --self-test
 
 ## Usage
 
-Check one file, or a folder. A folder is searched for `.sql` files, in sorted order. These three small
-synthetic scripts are the whole `demo` folder. The first, `demo/reload_lookup.sql`, is the story at the top:
+Check one file, or a folder. A folder is searched for `.sql` files, in sorted order. The repository
+holds four files and no sample scripts, so create the three small synthetic scripts below by hand in a folder named
+`demo`. The first, `demo/reload_lookup.sql`, is the story at the top:
 
 ```
 SET XACT_ABORT ON;
@@ -284,9 +285,11 @@ where only the same-batch `RAISERROR` case can occur.
 **R6. A UNC path with the wrong number of leading backslashes.** It runs only when you name hosts with
 `--unc-host`. A path to a listed host that starts with one, three or four backslashes is reported. So is a
 path with exactly two backslashes to a host that is not on the list, which catches a mistyped host. The
-rule reads string literals, including SQL inside SQL, and ignores comments. It never prints the path.
+rule reads string literals, including SQL inside SQL, and ignores comments. It prints the host name and the backslash count, never the rest of the path.
 Without the list the tool cannot tell a lost backslash from a real root-relative path such as `\Windows\Temp`,
 so R6 is off, and the first line of the output says so. `--rules R6` without a host is a usage error.
+A listed short name also covers its fully qualified form: with `--unc-host backupsrv`, a two-backslash path to
+`backupsrv.corp.example` is not reported. The match is on a whole first label, so `backupsrv2.corp.example` is.
 
 **E0. A quote or block comment that is never closed.** The tool stops reading that file, because
 nothing after the quote can be trusted. It reports E0 and exits 1. A missing quote therefore never gives a clean pass.
@@ -294,7 +297,21 @@ nothing after the quote can be trusted. It reports E0 and exits 1. A missing quo
 **Notes.** A note is not a finding and is not written to the CSV. It marks a place where code may hold a write
 that the tool did not read: `EXEC (...)` of a string that holds `INSERT`, `UPDATE`, `DELETE`, `MERGE` or
 `TRUNCATE` or is not a plain literal, `sp_executesql` with such a string, and a `:r` line. `EXEC` of a procedure
-is not a note, because the procedure body is another script. Notes are off when only R6 runs.
+is a note only when it follows a `DELETE` or `TRUNCATE` that runs outside a transaction (on a table that is not a
+temp table or table variable): the procedure body is another script, and it may refill the table. `EXEC` of a
+procedure with no such delete before it is not a note. Notes are off when only R6 runs.
+
+For a file `proc.sql` with `DELETE FROM dbo.Lookup;`, `GO`, `EXEC dbo.Refill;` and `GO` on four lines:
+
+```
+$ python txnlint.py proc.sql
+txnlint: rules R1 R2 R3 R5; R6 is off (name hosts with --unc-host to turn it on)
+proc.sql:3: note: EXEC runs a procedure that is not read, after DELETE FROM dbo.lookup at line 1 outside a transaction. It may refill the table.
+1 file(s) read, 0 finding(s).
+1 place(s) hold code that was not read. A clean result does not cover them.
+```
+
+The exit code is 3.
 
 ## The formula guard
 
@@ -372,10 +389,10 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | R3 reports a write before the `ROLLBACK`, and spares the safe shapes | "a log INSERT in CATCH", "the same CATCH with the ROLLBACK first", "a table variable survives ROLLBACK", "a CATCH that tests XACT_STATE", "a write before the XACT_STATE test", "a CATCH that commits and never rolls back", "a stray END TRY opens no transaction" |
 | R5 reports a THROW guard and a later write, and honours `:on error` and `TRY` | "a THROW guard in one batch", ":on error exit silences R5", "a THROW in TRY jumps to CATCH", "each guard is reported once", "a later batch with a guard of its own", "the innermost TRY decides", "a guard in a block inside TRY" |
 | R5 reads `RAISERROR` as a message that ends nothing, unless a `RETURN` follows | "RAISERROR is a guard at severity 11", "a RAISERROR guard and a write in the same batch", "a RETURN or GOTO in the same block", "a RETURN that is conditional", ":on error exit, a THROW, a RAISERROR in TRY", "a RAISERROR severity is read after an IF condition", "the advice differs", "a comma inside a nested call" |
-| R6 counts backslashes for a listed host and never prints the path | "a listed host needs exactly two backslashes", "a two-backslash path to an unlisted host", "an R6 message names the host and the count and never prints the path", "a path inside dynamic SQL", "a bracketed name or a bare word" |
-| `--unc-host` turns R6 on and no part of a path reaches the output or the CSV | "--unc-host turns R6 on, and no part of the path reaches the output or the CSV" |
+| R6 counts backslashes for a listed host and never prints the path | "a listed host needs exactly two backslashes", "a listed short host also covers its fully qualified name", "a two-backslash path to an unlisted host", "an R6 message names the host and the count and never prints the path", "a path inside dynamic SQL", "a bracketed name or a bare word" |
+| `--unc-host` turns R6 on, and nothing after the host name of a path reaches the output or the CSV (the host name does, and so does the count of backslashes) | "--unc-host turns R6 on, and nothing after the host name reaches the output or the CSV" |
 | The default run leaves R6 off and says so | "a clean file exits 0 and says which rules ran and that R6 is off", "a bad UNC path passes while R6 is off" |
-| Code that is not read gives a note and exit 3 | "EXEC of a string with a write or a variable", "a note says what was not read", "a procedure call, a harmless string", "the gate gives 3", "a script made only of dynamic SQL exits 3", "a finding wins over a note", "a run with only R6" |
+| Code that is not read gives a note and exit 3 | "EXEC of a string with a write or a variable", "a note says what was not read", "a procedure call, a harmless string", "a procedure run after an unprotected DELETE or TRUNCATE is a note", "no note for a procedure before the delete", "the gate gives 3", "a script made only of dynamic SQL exits 3", "a finding wins over a note", "a run with only R6" |
 | A path or message that starts with `=`, `+`, `-`, `@`, a tab or a CR is written with one leading apostrophe, and `line` and `batch` stay numbers | six assertions "a path and a message that start with equals", "plus", "minus", "at", "tab" and "CR" (each writes a CSV with `write_findings`, reads it back with `csv.reader` and checks the raw text) |
 | Text that does not start with one of them, and a number, is not changed | "text that does not start with a formula character, and a number, pass through unchanged" |
 | A script whose file name starts with `=`, `+`, `-` or `@` gets a guarded `path` in the CSV and an unguarded console line, through the real command line | four assertions "a script named equals", "plus", "minus" and "at" |
@@ -392,10 +409,10 @@ to anything else. It prints the rule text with table and host names. It does not
 
 ## Measured
 
-- Branch coverage is 100 percent: 943 statements and 366 branches, measured with
+- Branch coverage is 100 percent: 963 statements and 378 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 183 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 186 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
@@ -424,10 +441,10 @@ to anything else. It prints the rule text with table and host names. It does not
 
 | Code | Meaning |
 |---|---|
-| 0 | No finding, and no code was left unread. |
+| 0 | No finding, and no note. A procedure body is not read, except that a procedure run after an unprotected `DELETE` or `TRUNCATE` gives a note. |
 | 1 | At least one finding, including E0. |
 | 2 | A file could not be read or decoded, a folder could not be listed or holds no `.sql` file, or `--out` could not be written. |
-| 3 | No finding, but a note says that some code was not read (`EXEC` of a string that may hold a write, `sp_executesql`, `:r`). |
+| 3 | No finding, but a note says that some code was not read (`EXEC` of a string that may hold a write, `sp_executesql`, `:r`, or `EXEC` of a procedure after an unprotected `DELETE` or `TRUNCATE`). |
 | 64 | Usage error: no path, an unknown flag or abbreviation, a bad rule or host, `--apply` without `--out`, or `--out` naming an input. |
 
 ## Limits
@@ -469,8 +486,8 @@ to anything else. It prints the rule text with table and host names. It does not
   different tables took about 10 seconds in my run.
 - R6 reads each string literal on its own, so a UNC path split across a concatenation (`N'\\host' + N'\share'`) is not seen.
 - R6 does not flag a listed host written with no leading backslash (`host\share`), because that looks like `server\instance`.
-- R6 compares the host exactly, so `\\backupsrv.example.net\share` is reported as an unlisted host when you passed only
-  `backupsrv` to `--unc-host`. List the full name too.
+- R6 matches a listed host exactly or as the first label of a longer name. A listed `backupsrv` therefore also accepts
+  `backupsrv.other.example`, a different host in a different domain. A listed full name does not accept the short name.
 
 **What counts as a batch break.**
 
@@ -484,6 +501,8 @@ to anything else. It prints the rule text with table and host names. It does not
   when the UTF-8 decode fails.
 - A UTF-16 or UTF-32 script with no byte order mark is decoded as UTF-8. Its NUL bytes hide every keyword, and the file passes as clean with exit 0.
 - A zero-byte or BOM-only `.sql` file is reported as `0 finding(s)` with exit 0, so a truncated deployment script looks clean.
+- The only procedure calls that give a note are those after an unprotected `DELETE` or `TRUNCATE`. A procedure that
+  deletes and refills inside its own body is another script. Lint that script on its own.
 - A double-quoted string, which is a string only when `QUOTED_IDENTIFIER` is off, is read as a name.
 - A subfolder that is reached only through a symbolic link is not followed, and its `.sql` files are skipped without a message.
   A folder that holds only such a link exits 2 with `no .sql file found`.
@@ -497,8 +516,16 @@ to anything else. It prints the rule text with table and host names. It does not
   Then `--apply` overwrites the script with the CSV. I reproduced it on Linux with `ln victim.sql hl.sql` and `--out hl.sql --apply`.
 - `--out` with `--apply` overwrites any existing file that is not an input of this run, for example a sibling `.sql` script, without asking.
 - The CSV is opened for writing before it is filled. A disk-full or I/O error part way through leaves a truncated report file, and the tool exits 2.
+- A note is not written to the CSV, so a header-only CSV does not mean clean. Read the console output or the exit
+  code 3. This holds for a run with `--apply`.
+- A run that fails with exit 2 before it writes leaves an older `--out` file untouched. A caller that reads only the file
+  sees the result of the previous run.
+- The demo scripts are printed in this README only. Create them by hand to repeat the sample runs.
+- Messages start with fixed tool text (a verb, a rule phrase, `EXEC`), so in practice only `path` can start with a
+  formula character: a hostile folder argument or a file named on the command line. The guard on `message` is a second layer.
 - The formula guard covers the six characters listed above. OWASP also lists line feed and the full-width
-  `=`, `+`, `-` and `@`. A cell that starts with one of those is written as it came.
+  `=`, `+`, `-` and `@`. `safe()` already turns a leading full-width character in `path` into a backslash escape, so only a
+  leading line feed in `path`, or any of these in a `message`, is written as it came.
 - OWASP warns that an apostrophe prefix is not reliable in Microsoft Excel after the file is saved and opened
   again, and names a tab prefix as the Excel-resistant form. No assertion opens Excel or any spreadsheet:
   the guard is checked on the CSV text only. Treat it as one layer.
