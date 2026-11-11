@@ -366,8 +366,10 @@ def governed_by_if(toks, k):
     return governing(toks, k) >= 0
 
 
-def tests_state(toks, k):
+def tests_state(toks, k, words=("@@TRANCOUNT", "XACT_STATE")):
     """True when the condition that governs k reads @@TRANCOUNT or XACT_STATE().
+
+    `words` narrows the test, for example to XACT_STATE alone.
 
     IF @@TRANCOUNT = 0 BEGIN TRANSACTION opens a transaction on every path, because the
     other path already has one. An ELSE is judged by the nearest IF before it.
@@ -377,7 +379,17 @@ def tests_state(toks, k):
     if toks[j].u == "ELSE":
         j = max([i for i in range(j) if toks[i].u == "IF" and toks[i].batch == toks[j].batch],
                 default=j)
-    return any(t.u in ("@@TRANCOUNT", "XACT_STATE") for t in toks[j:k])
+    return any(t.u in words for t in toks[j:k])
+
+
+def state_guards(toks, k, stack):
+    """True when an IF or ELSE that reads XACT_STATE() governs the statement at k.
+
+    The IF may govern k directly or govern a BEGIN block that holds k.
+    """
+    if governed_by_if(toks, k) and tests_state(toks, k, ("XACT_STATE",)):
+        return True
+    return any(s == "cblock" and tests_state(toks, i, ("XACT_STATE",)) for s, i in stack)
 
 
 def pair_ends(toks):
@@ -505,12 +517,24 @@ def leaves_batch(toks, k, words=("RETURN", "GOTO"), stop_at_write=True):
 _WRITE_WORD = re.compile(r"\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b", re.IGNORECASE)
 
 
+def plain_text(body):
+    """The text of a string made only of literals joined by +, or None for anything else.
+
+    A variable, a function call or a number makes the string unreadable. The end-of-input
+    token counts as an empty literal, so `sp_executesql` with no argument is not a note.
+    """
+    if len(body) % 2 == 0 or not all(x.kind in ("s", "e") for x in body[0::2])             or not all(is_p(x, "+") for x in body[1::2]):
+        return None
+    return "".join(x.val for x in body[0::2])
+
+
 def unread(toks):
     """Places where code that may hold a write is not read: (line, batch, message).
 
-    EXEC of a string that holds a write verb or is not a plain literal, sp_executesql
-    with such a string, and :r. EXEC of a procedure is not listed: its body is a
-    different script. A string that holds no write verb is harmless to R1, R2, R3 and R5.
+    EXEC of a string that holds a write verb or is not made only of literals, sp_executesql
+    with such a string, and :r. Literals joined by + are read as one string, so
+    N'DE' + N'LETE' counts as DELETE. EXEC of a procedure is not listed here: its body is
+    a different script. A plain literal with no write verb is harmless to R1, R2, R3 and R5.
     """
     out = []
     for k, t in enumerate(toks):
@@ -521,8 +545,10 @@ def unread(toks):
             body = [x for arg in paren_args(toks, k + 1)[0] for x in arg]
         elif t.u == "SP_EXECUTESQL":
             body = [at(toks, k + 1)]
-        if any(x.kind in ("w", "i") or (x.kind == "s" and _WRITE_WORD.search(x.val))
-               for x in body):
+            while is_p(at(toks, k + 1 + len(body)), "+"):
+                body += [at(toks, k + 1 + len(body)), at(toks, k + 2 + len(body))]
+        text = plain_text(body)
+        if body and (text is None or _WRITE_WORD.search(text)):
             out.append((t.line, t.batch, "%s runs a string that is not read, and it may "
                         "hold a write" % t.u))
     return out
@@ -596,8 +622,6 @@ def scan(toks):
             add("rollback", at(toks, k + 2).val.lower() if nxt.u in _TRAN_WORDS else "", leaves)
         elif t.u == "SAVE" and nxt.u in _TRAN_WORDS:
             add("save", at(toks, k + 2).val.lower())
-        elif t.u == "XACT_STATE":
-            add("xstate")
         elif t.u == "THROW":
             add("guard", "THROW", False)
         elif t.u == "RAISERROR":
@@ -620,9 +644,9 @@ def scan(toks):
             if not (t.u == "ALTER" and at(toks, k - 1).u == "OR") and at(toks, j).u in _MODULES:
                 add("module")
         elif t.u in ("EXEC", "EXECUTE") and nxt.u not in ("", "AS", "SP_EXECUTESQL")                 and not is_p(nxt, "(") and at(toks, k - 1).u not in _NOT_AFTER:
-            add("exec")
+            add("exec", "", None, state_guards(toks, k, stack))
         elif t.u in _WRITES and is_statement_start(toks, k):
-            add("write", write_target(toks, k), t.u)
+            add("write", write_target(toks, k), t.u, state_guards(toks, k, stack))
     # ROLLBACK TRAN name undoes only part of a transaction when name is a savepoint.
     saves = set()
     for i, e in enumerate(evs):
@@ -729,11 +753,13 @@ def rule_r2(evs):
              % (len(hits), lines, ", ..." if len(hits) > 5 else ""))]
 
 
-def rule_r3(evs):
-    """A write in a CATCH block before the ROLLBACK that follows it.
+def catch_pending(evs):
+    """Writes and procedure calls in a CATCH block before its ROLLBACK: (event, rollback).
 
-    A CATCH that tests XACT_STATE before it writes is assumed to branch on the
-    answer, so its later writes are not reported.
+    Only a CATCH whose TRY held a transaction counts. An IF that reads XACT_STATE() and
+    governs the statement is assumed to branch on the answer, so that statement is left
+    out. A XACT_STATE() test that governs nothing, such as one that only prints, is not
+    a branch.
     """
     tries, closed, catches, out = [], False, [], []
     for e, in_tran in walk(evs):
@@ -744,31 +770,45 @@ def rule_r3(evs):
         elif e.kind == "endtry":
             closed = tries.pop() if tries else False
         elif e.kind == "catch":
-            catches.append({"tran": closed, "rolled": False, "checked": False, "pending": []})
+            catches.append({"tran": closed, "rolled": False, "pending": []})
         elif e.kind == "endcatch":
             if catches:
                 catches.pop()
-        elif e.kind == "xstate":
-            if catches:
-                catches[-1]["checked"] = True
         elif e.kind == "rollback":
             if catches and not catches[-1]["rolled"]:
                 catches[-1]["rolled"] = True
-                for w in catches[-1]["pending"]:
-                    out.append((w.line, w.batch,
-                                "A write (%s) to %s in the CATCH block runs before the "
-                                "ROLLBACK at line %d. An uncommittable transaction cannot "
-                                "run a write, and a write that does run is undone by the "
-                                "ROLLBACK. Put ROLLBACK first, or log to a table variable."
-                                % (w.extra, safe(w.name), e.line)))
-        elif e.kind == "write":
-            if in_tran:
+                out += [(w, e) for w in catches[-1]["pending"]]
+        elif e.kind in ("write", "exec"):
+            if in_tran and e.kind == "write":
                 tries[:] = [True] * len(tries)
             if catches:
                 c = catches[-1]
-                if c["tran"] and not c["checked"] and not e.name.startswith("@"):
+                if c["tran"] and not e.ref and not e.name.startswith("@"):
                     c["pending"].append(e)
     return out
+
+
+def rule_r3(evs):
+    """A write in a CATCH block before the ROLLBACK that follows it."""
+    return [(w.line, w.batch,
+             "A write (%s) to %s in the CATCH block runs before the "
+             "ROLLBACK at line %d. An uncommittable transaction cannot "
+             "run a write, and a write that does run is undone by the "
+             "ROLLBACK. Put ROLLBACK first, or log to a table variable."
+             % (w.extra, safe(w.name), r.line))
+            for w, r in catch_pending(evs) if w.kind == "write"]
+
+
+def exec_in_catch(evs):
+    """A procedure run in a CATCH block before its ROLLBACK: (line, batch, message).
+
+    The procedure body is another script. If it writes a log row, R3 applies to it, so a
+    clean result would be a guess.
+    """
+    return [(w.line, w.batch,
+             "EXEC runs a procedure that is not read, in the CATCH block before the "
+             "ROLLBACK at line %d. If it writes, the ROLLBACK undoes the write." % r.line)
+            for w, r in catch_pending(evs) if w.kind == "exec"]
 
 
 def rule_r5(evs):
@@ -882,7 +922,7 @@ def analyse(text, path="<text>", rules=DEFAULT_RULES, hosts=()):
     if set(rules) & set(DEFAULT_RULES):
         found = unread(toks)
         for _, uevs in units(evs):
-            found += exec_after_delete(uevs)
+            found += exec_after_delete(uevs) + exec_in_catch(uevs)
         notes = [Finding(path, ln, b, "note", msg) for ln, b, msg in sorted(found)]
     return sorted(out, key=lambda f: (f.line, f.rule, f.message)), notes
 
@@ -1427,6 +1467,20 @@ def _run_checks(check, raises, tmp):
     check(lint(S("SELECT XACT_STATE();", "BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH",
                  "ROLLBACK;", "END CATCH")) == [],
           "XACT_STATE outside a CATCH changes nothing")
+    tran_try = ("BEGIN TRY", "BEGIN TRANSACTION;", "UPDATE dbo.A SET x = 1;", "COMMIT;",
+                "END TRY", "BEGIN CATCH")
+    check(lint(S(*(tran_try + ("IF XACT_STATE() = -1 PRINT 'uncommittable';",
+                               "INSERT INTO dbo.RunLog VALUES (1);",
+                               "IF @@TRANCOUNT > 0 ROLLBACK;", "END CATCH")))) == [("R3", 8)],
+          "an XACT_STATE test that only prints does not spare the write after it" + PIN)
+    check(lint(S(*(tran_try + ("IF XACT_STATE() = 1 INSERT INTO dbo.RunLog VALUES (1);",
+                               "ROLLBACK;", "END CATCH")))) == []
+          and lint(S(*(tran_try + ("IF XACT_STATE() = 1 PRINT 'a';",
+                                   "ELSE INSERT INTO dbo.RunLog VALUES (1);",
+                                   "ROLLBACK;", "END CATCH")))) == []
+          and lint(S(*(tran_try + ("IF @@TRANCOUNT > 0 INSERT INTO dbo.RunLog VALUES (1);",
+                                   "ROLLBACK;", "END CATCH")))) == [("R3", 7)],
+          "a write that an IF or ELSE on XACT_STATE governs is spared, one on @@TRANCOUNT is not")
     check(lint(S("SET IMPLICIT_TRANSACTIONS ON;", "BEGIN TRY", "UPDATE dbo.A SET x = 1;",
                  "END TRY", "BEGIN CATCH", "INSERT INTO dbo.RunLog VALUES (1);", "ROLLBACK;",
                  "END CATCH")) == [("R3", 6)],
@@ -1686,6 +1740,30 @@ def _run_checks(check, raises, tmp):
           and notes("EXEC sp_executesql") == [] and notes("EXEC('SELECT ' + 'x')") == []
           and notes("EXEC('DELETE FROM t'); :r a.sql", ("R6",)) == [],
           "a procedure call, a harmless string and a run with only R6 list nothing")
+    check(notes("EXEC (N'DE' + N'LETE FROM dbo.Lookup');") == [(1, "EXEC")]
+          and notes("EXEC ('UPD' + 'ATE t SET a = 1' + '')") == [(1, "EXEC")]
+          and notes("EXEC sp_executesql N'DE' + N'LETE FROM dbo.t';") == [(1, "SP_EXECUTESQL")]
+          and notes("EXEC ('SELECT ' + @col)") == [(1, "EXEC")]
+          and notes("EXEC ('SELECT ' + CHAR(68))") == [(1, "EXEC")]
+          and notes("EXEC ('SELECT ' 'x')") == [(1, "EXEC")]
+          and notes("EXEC ('SELECT ' + 'name FROM sys.objects')") == []
+          and notes("EXEC sp_executesql N'SELECT ' + N'1', N'@a int', @a = 1") == [],
+          "a string joined from literals is read as one, so a split verb is a note" + PIN)
+    ctry = ("BEGIN TRY", "BEGIN TRANSACTION;", "UPDATE dbo.A SET x = 1;", "COMMIT;", "END TRY",
+            "BEGIN CATCH")
+    check(notes(S(*(ctry + ("EXEC dbo.usp_LogError;", "ROLLBACK;", "END CATCH")))) == [(7, "EXEC")]
+          and notes(S(*(ctry + ("ROLLBACK;", "EXEC dbo.usp_LogError;", "END CATCH")))) == []
+          and notes(S("BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH",
+                      "EXEC dbo.usp_LogError;", "ROLLBACK;", "END CATCH")) == []
+          and notes(S(*(ctry + ("IF XACT_STATE() = 1 EXEC dbo.usp_LogError;", "ROLLBACK;",
+                                "END CATCH")))) == []
+          and notes(S(*(ctry + ("EXEC dbo.usp_LogError;", "ROLLBACK;", "END CATCH"))),
+                    ("R6",)) == [],
+          "a procedure run in a CATCH before the ROLLBACK is a note, and the safe shapes are not"
+          + PIN)
+    got = analyse(S(*(ctry + ("EXEC dbo.usp_LogError;", "ROLLBACK;", "END CATCH"))), "t.sql")
+    check(gate(*got) == 3 and "ROLLBACK at line 8" in got[1][0].message,
+          "a procedure in a CATCH before the ROLLBACK gives exit 3 and names the ROLLBACK")
     check(notes(S("DELETE FROM dbo.Lookup;", "GO", "EXEC dbo.Refill;")) == [(3, "EXEC")]
           and notes(S("TRUNCATE TABLE dbo.Lookup", "EXEC dbo.Refill")) == [(2, "EXEC")]
           and notes(S("DELETE FROM dbo.Lookup;", "EXECUTE @rc = dbo.Refill;")) == [(2, "EXEC")]

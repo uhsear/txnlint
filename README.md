@@ -39,6 +39,7 @@ PASS  SET XACT_ABORT ON with two bare writes is R2
 PASS  a log INSERT in CATCH before the ROLLBACK is R3
 ...
 PASS  a CATCH that tests XACT_STATE before it writes is not R3, and one that does not is  <-- pinned defect
+PASS  an XACT_STATE test that only prints does not spare the write after it  <-- pinned defect
 ...
 PASS  a THROW guard in one batch and a DELETE in the next is R5
 ...
@@ -52,6 +53,9 @@ PASS  an R6 message about an unlisted host does not print it, because it may be 
 ...
 PASS  UTF-16 without a BOM file exits 2 and names the cause, and does not report it clean  <-- pinned defect
 ...
+PASS  a string joined from literals is read as one, so a split verb is a note  <-- pinned defect
+PASS  a procedure run in a CATCH before the ROLLBACK is a note, and the safe shapes are not  <-- pinned defect
+...
 PASS  a script made only of dynamic SQL exits 3, not the 0 that means clean  <-- pinned defect
 ...
 PASS  a path and a message that start with equals each get one leading apostrophe, and line and batch stay bare numbers  <-- pinned defect
@@ -63,10 +67,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-204 assertions, 0 failed
+209 assertions, 0 failed
 ```
 
-The full run prints all 204 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 209 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -278,8 +282,10 @@ transaction.
 **R3. A write in a `CATCH` block before the `ROLLBACK` that follows it.** After an error, a transaction
 can be uncommittable, and it can then run only reads and a `ROLLBACK`. If it is still committable, the
 `ROLLBACK` that follows undoes the write. In both cases the log row is lost while the transaction is still open. A table variable survives a
-`ROLLBACK`, so a write to one is not reported. A `CATCH` that tests `XACT_STATE()` before it writes is
-assumed to branch on the answer, and it is not reported. Fix: put `ROLLBACK` first, then log.
+`ROLLBACK`, so a write to one is not reported. A write that an `IF` or `ELSE` on `XACT_STATE()` governs, directly
+or through a `BEGIN` block, is assumed to branch on the answer, and it is not reported. A `XACT_STATE()` test
+that governs nothing, such as `IF XACT_STATE() = -1 PRINT ...;` followed by the log `INSERT`, is not a branch,
+and the `INSERT` is reported. A test of `@@TRANCOUNT` does not spare a write either. Fix: put `ROLLBACK` first, then log.
 
 **R5. A `THROW` or `RAISERROR` guard, then a write that runs although the guard fired.** `GO` is a command of
 the client tools. Each batch it ends is sent separately. A `THROW` outside `TRY...CATCH` ends its own batch
@@ -317,10 +323,14 @@ nothing after the quote can be trusted. It reports E0 and exits 1. A missing quo
 
 **Notes.** A note is not a finding and is not written to the CSV. It marks a place where code may hold a write
 that the tool did not read: `EXEC (...)` of a string that holds `INSERT`, `UPDATE`, `DELETE`, `MERGE` or
-`TRUNCATE` or is not a plain literal, `sp_executesql` with such a string, and a `:r` line. `EXEC` of a procedure
-is a note only when it follows a `DELETE` or `TRUNCATE` that runs outside a transaction (on a table that is not a
+`TRUNCATE`, or is not made only of string literals, `sp_executesql` with such a string, and a `:r` line. Literals
+joined with `+` are read as one string, so `N'DE' + N'LETE FROM dbo.Lookup'` is a note and `'SELECT ' + 'name'` is
+not. A variable, a function call or a number in the string is always a note. `EXEC` of a procedure in a `CATCH`
+block whose `TRY` held a transaction is a note when it runs before the `ROLLBACK`, because a procedure that
+logs a row there is the R3 mistake in another script. An `IF` on `XACT_STATE()` that governs the `EXEC` spares it.
+`EXEC` of a procedure is otherwise a note only when it follows a `DELETE` or `TRUNCATE` that runs outside a transaction (on a table that is not a
 temp table or table variable): the procedure body is another script, and it may refill the table. `EXEC` of a
-procedure with no such delete before it is not a note. Notes are off when only R6 runs.
+procedure that fits neither case is not a note. Notes are off when only R6 runs.
 
 For a file `proc.sql` with `DELETE FROM dbo.Lookup;`, `GO`, `EXEC dbo.Refill;` and `GO` on four lines:
 
@@ -411,14 +421,14 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
 | R2 sees `XACT_ABORT` across `GO` and ignores scratch tables | "SET XACT_ABORT ON with two bare writes", "XACT_ABORT set in one batch", "inside a procedure only its own SET counts", "scratch writes do not count", "R2 points at the SET", "R2 lists five lines" |
-| R3 reports a write before the `ROLLBACK`, and spares the safe shapes | "a log INSERT in CATCH", "the same CATCH with the ROLLBACK first", "a table variable survives ROLLBACK", "a CATCH that tests XACT_STATE", "a write before the XACT_STATE test", "a CATCH that commits and never rolls back", "a stray END TRY opens no transaction" |
+| R3 reports a write before the `ROLLBACK`, and spares the safe shapes | "a log INSERT in CATCH", "the same CATCH with the ROLLBACK first", "a table variable survives ROLLBACK", "a CATCH that tests XACT_STATE", "an XACT_STATE test that only prints", "a write that an IF or ELSE on XACT_STATE governs", "a write before the XACT_STATE test", "a CATCH that commits and never rolls back", "a stray END TRY opens no transaction" |
 | R5 reports a THROW guard and a later write, and honours `:on error` and `TRY` | "a THROW guard in one batch", ":on error exit silences R5", "a THROW in TRY jumps to CATCH", "each guard is reported once", "a later batch with a guard of its own", "the innermost TRY decides", "a guard in a block inside TRY" |
 | A write in the `ELSE` of the `IF` that holds a `RAISERROR` is not reported for it, and a write after the `IF` still is | "a write in the ELSE of an IF whose branch is a RAISERROR", "the same holds when the RAISERROR is in a BEGIN block", "an ELSE IF chain, a WHILE, a nested IF", "a write after the whole IF and ELSE", "the skipped branch ends at a GO", "a skipped branch is marked on and off" |
 | R5 reads `RAISERROR` as a message that ends nothing, unless a `RETURN` follows | "RAISERROR is a guard at severity 11", "a RAISERROR guard and a write in the same batch", "a RETURN or GOTO in the same block", "a RETURN that is conditional", ":on error exit, a THROW, a RAISERROR in TRY", "a RAISERROR severity is read after an IF condition", "the advice differs", "a comma inside a nested call" |
 | R6 counts backslashes for a listed host and never prints the path or an unlisted host name | "a listed host needs exactly two backslashes", "a listed short host also covers its fully qualified name", "a two-backslash path to an unlisted host", "an R6 message about a listed host names the host and never prints the path", "an R6 message about an unlisted host does not print it", "an R6 message about a listed short name prints the listed name", "a path inside dynamic SQL", "a bracketed name or a bare word" |
 | `--unc-host` turns R6 on, and neither the host name of a path nor anything after it reaches the output or the CSV | "--unc-host turns R6 on, and nothing after the host name reaches the output or the CSV" |
 | The default run leaves R6 off and says so | "a clean file exits 0 and says which rules ran and that R6 is off", "a bad UNC path passes while R6 is off" |
-| Code that is not read gives a note and exit 3 | "EXEC of a string with a write or a variable", "a note says what was not read", "a procedure call, a harmless string", "a procedure run after an unprotected DELETE or TRUNCATE is a note", "no note for a procedure before the delete", "the gate gives 3", "a script made only of dynamic SQL exits 3", "a finding wins over a note", "a run with only R6" |
+| Code that is not read gives a note and exit 3 | "EXEC of a string with a write or a variable", "a note says what was not read", "a procedure call, a harmless string", "a string joined from literals is read as one", "a procedure run in a CATCH before the ROLLBACK", "a procedure in a CATCH before the ROLLBACK gives exit 3", "a procedure run after an unprotected DELETE or TRUNCATE is a note", "no note for a procedure before the delete", "the gate gives 3", "a script made only of dynamic SQL exits 3", "a finding wins over a note", "a run with only R6" |
 | A path or message that starts with `=`, `+`, `-`, `@`, a tab or a CR is written with one leading apostrophe, and `line` and `batch` stay numbers | six assertions "a path and a message that start with equals", "plus", "minus", "at", "tab" and "CR" (each writes a CSV with `write_findings`, reads it back with `csv.reader` and checks the raw text) |
 | Text that does not start with one of them, and a number, is not changed | "text that does not start with a formula character, and a number, pass through unchanged" |
 | A script whose file name starts with `=`, `+`, `-` or `@` gets a guarded `path` in the CSV and an unguarded console line, through the real command line | four assertions "a script named equals", "plus", "minus" and "at" |
@@ -436,10 +446,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1085 statements and 448 branches, measured with
+- Branch coverage is 100 percent: 1102 statements and 446 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 204 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 209 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
@@ -468,10 +478,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 | Code | Meaning |
 |---|---|
-| 0 | No finding, and no note. A procedure body is not read, except that a procedure run after an unprotected `DELETE` or `TRUNCATE` gives a note. |
+| 0 | No finding, and no note. A procedure body is not read, except that a procedure run after an unprotected `DELETE` or `TRUNCATE`, or in a `CATCH` block before its `ROLLBACK`, gives a note. |
 | 1 | At least one finding, including E0. |
 | 2 | A file could not be read or decoded, a folder could not be listed or holds no `.sql` file, or `--out` could not be written. |
-| 3 | No finding, but a note says that some code was not read (`EXEC` of a string that may hold a write, `sp_executesql`, `:r`, or `EXEC` of a procedure after an unprotected `DELETE` or `TRUNCATE`). |
+| 3 | No finding, but a note says that some code was not read (`EXEC` of a string that may hold a write, `sp_executesql`, `:r`, `EXEC` of a procedure after an unprotected `DELETE` or `TRUNCATE`, or `EXEC` of a procedure in a `CATCH` block before its `ROLLBACK`). |
 | 64 | Usage error: no path, an unknown flag or abbreviation, a bad rule or host, `--apply` without `--out`, or `--out` naming an input. |
 
 ## Limits
@@ -482,7 +492,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - It reads SQL in plain statements. The text inside `EXEC('...')` and `sp_executesql` is not read, except
   that R6 looks inside every string literal. The tool prints a note for such a string when it may hold a
   write, and for every `:r` line. Lint an included file on its own. A `CATCH` block that calls a logging
-  procedure with `EXEC` is not seen, so R3 reports only direct writes.
+  procedure with `EXEC` before the `ROLLBACK` gives a note, not a finding, because the procedure body is not read.
 - It reads a script from top to bottom. Both branches of an `IF ... ELSE` count as one run, and a loop body
   counts once. A `DELETE` in one branch and an `INSERT` in the other is reported by R1.
 - It cannot know who calls a procedure. R1 and R2 read a procedure body as if nothing wraps it. A
@@ -546,8 +556,13 @@ to anything else. It prints the rule text with table names and, for R6, the name
   mark and UTF-32 with or without one. Save such a file as UTF-8, or as UTF-16 with a byte order mark.
 - A zero-byte or BOM-only `.sql` file is reported as `0 finding(s)` with exit 0, so a truncated deployment script looks clean.
   Check file sizes before you trust exit 0.
-- The only procedure calls that give a note are those after an unprotected `DELETE` or `TRUNCATE`. A procedure that
-  deletes and refills inside its own body is another script. Lint that script on its own.
+- The only procedure calls that give a note are those after an unprotected `DELETE` or `TRUNCATE`, and those in a
+  `CATCH` block before its `ROLLBACK`. A procedure that deletes and refills inside its own body is another script.
+  Lint that script on its own. A procedure that writes after an unwrapped `UPDATE` is not seen.
+- R1 reports only a `DELETE` that runs outside a transaction. A `DELETE` that is committed in one transaction before
+  the `INSERT` opens a second one is not reported, although the rows are already gone when the `INSERT` starts.
+- A write verb hidden by a variable, `CHAR()` or `EXEC` of a string built at run time is a note, never a finding,
+  because the tool does not run the code.
 - A double-quoted string, which is a string only when `QUOTED_IDENTIFIER` is off, is read as a name.
 - A subfolder that is reached only through a symbolic link is not followed, and its `.sql` files are skipped without a message.
   A folder that holds only such a link exits 2 with `no .sql file found`.
@@ -585,7 +600,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - `safe()` rewrites a non-ASCII path with backslash escapes in the report and in the CSV, so the printed path may not match the real file name.
 - `safe()` escapes only non-ASCII characters. A table, alias or file name that holds a control character or an escape sequence is printed raw,
   so a hostile `.sql` file can put terminal escape codes or fake lines into the report.
-- `LICENSE` is stored with CRLF line endings and the other three files use LF. The license text and the copyright line are correct.
+- The committed `LICENSE` uses LF like the other three files. A Windows checkout with `core.autocrlf=true` may show CRLF in the working tree. The license text and the copyright line are correct.
 - The guard on `message` is exercised only through `write_findings` with a synthetic finding. No real message can start
   with `=`, `+`, `-`, `@`, tab or carriage return, so no command-line case reaches that guard end to end.
 - The `isinstance` test inside the cell guard has no assertion of its own. Removing it turns the self-test red by a
