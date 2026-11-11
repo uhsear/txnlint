@@ -46,6 +46,8 @@ PASS  a listed host needs exactly two backslashes, in any case
 ...
 PASS  a script made only of dynamic SQL exits 3, not the 0 that means clean  <-- pinned defect
 ...
+PASS  a path and a message that start with equals each get one leading apostrophe, and line and batch stay bare numbers  <-- pinned defect
+...
 PASS  a unique prefix --ap of a long flag is refused with 64  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
@@ -53,10 +55,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-171 assertions, 0 failed
+183 assertions, 0 failed
 ```
 
-The full run prints all 171 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 183 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -294,6 +296,38 @@ that the tool did not read: `EXEC (...)` of a string that holds `INSERT`, `UPDAT
 `TRUNCATE` or is not a plain literal, `sp_executesql` with such a string, and a `:r` line. `EXEC` of a procedure
 is not a note, because the procedure body is another script. Notes are off when only R6 runs.
 
+## The formula guard
+
+The CSV holds text that comes from outside the tool: the `path` of each script and the `message` of each
+finding. A message names tables and aliases that the script chose. A spreadsheet runs a text cell as a
+formula when it starts with `=`, `+`, `-`, `@`, a tab or a carriage return. OWASP's
+[CSV Injection](https://owasp.org/www-community/attacks/CSV_Injection) page lists those six characters,
+and also line feed and the full-width forms of the first four. Python's `csv` module writes a cell exactly
+as given. Before this guard, a script named `=evil.sql` reached the file as a cell that starts with `=`.
+
+`write_findings` now passes the `path` and `message` cells through `cell()`:
+
+- A text cell that starts with one of the six characters gets one leading apostrophe. `=evil.sql`
+  becomes `'=evil.sql`. The apostrophe is data, so a CSV reader shows it.
+- `line` and `batch` are integers and are never touched. `rule` and the header are fixed by the tool.
+- Only the start of a cell matters, so `a=b` and `x-` are written as they came.
+- The console report is not changed. It is not a CSV.
+- The tool never reads its own CSV. No code outside the self-test calls `csv.reader`, and an assertion
+  parses the source to show that. So no strip-on-read exists to get wrong.
+  A consumer that joins on `path` must strip one leading apostrophe itself.
+
+```
+$ python txnlint.py --out findings.csv --apply -- =evil.sql
+...
+=evil.sql:1: R1 DELETE FROM dbo.lookup runs outside a transaction and commits by itself. ...
+wrote findings.csv
+$ cat findings.csv
+path,line,batch,rule,message
+'=evil.sql,1,1,R1,"DELETE FROM dbo.lookup runs outside a transaction and commits by itself. ..."
+```
+
+The `--` ends the options, so the name `=evil.sql` cannot be read as a flag. A script named `-evil.sql` needs it.
+
 ## What the SQL Server documentation says
 
 Each fact below comes from the Microsoft Learn page named beside it. I read each page, or its Markdown source in the
@@ -342,6 +376,10 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | `--unc-host` turns R6 on and no part of a path reaches the output or the CSV | "--unc-host turns R6 on, and no part of the path reaches the output or the CSV" |
 | The default run leaves R6 off and says so | "a clean file exits 0 and says which rules ran and that R6 is off", "a bad UNC path passes while R6 is off" |
 | Code that is not read gives a note and exit 3 | "EXEC of a string with a write or a variable", "a note says what was not read", "a procedure call, a harmless string", "the gate gives 3", "a script made only of dynamic SQL exits 3", "a finding wins over a note", "a run with only R6" |
+| A path or message that starts with `=`, `+`, `-`, `@`, a tab or a CR is written with one leading apostrophe, and `line` and `batch` stay numbers | six assertions "a path and a message that start with equals", "plus", "minus", "at", "tab" and "CR" (each writes a CSV with `write_findings`, reads it back with `csv.reader` and checks the raw text) |
+| Text that does not start with one of them, and a number, is not changed | "text that does not start with a formula character, and a number, pass through unchanged" |
+| A script whose file name starts with `=`, `+`, `-` or `@` gets a guarded `path` in the CSV and an unguarded console line, through the real command line | four assertions "a script named equals", "plus", "minus" and "at" |
+| The tool reads no CSV, so there is nothing to strip on read | "outside the self-test the tool has no csv reader" |
 | `--out` writes only with `--apply`, and never over an input | "--out without --apply writes nothing", "--out with --apply writes the header", "--out naming an input script is refused" |
 | A prefix of any long flag is refused with 64 | seven assertions, "a unique prefix --ap", "--app", "--appl", "--ou", "--unc", "--rule", "--self", and "--ap next to --out writes nothing" |
 | UTF-16, UTF-8 with a byte order mark and cp1252 scripts are read | "UTF-16 either way round", "a UTF-16 script with a byte order mark", "a broken UTF-16 file exits 2" |
@@ -354,13 +392,19 @@ to anything else. It prints the rule text with table and host names. It does not
 
 ## Measured
 
-- Branch coverage is 100 percent: 913 statements and 360 branches, measured with
+- Branch coverage is 100 percent: 943 statements and 366 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 171 assertions with 0 failed on every interpreter I ran: Python 3.9.25, 3.10.20,
-  3.11.15, 3.12.10 and 3.13.2 on Windows, and Python 3.11.16 and 3.12.3 on Linux. The output text of all seven
-  runs is the same once Windows' carriage returns are removed, so there is no difference to explain.
-- A one-off sweep of 425 single-token mutations (swap `and` and `or`, flip a comparison, turn `break` or
+- The self-test prints 183 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+  3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
+  output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
+  removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
+  3.11.15 and 3.11.16 and printed the same count as the others.
+- Coverage was measured on Windows only. The Linux host has no `coverage` package.
+- I broke the new guard six ways in a scratch copy: no apostrophe at all, no guard on `message`, no guard on
+  `path`, no `isinstance` test, no tab in the list, and a `csv.reader` call added to production code. The
+  self-test went red every time.
+- An earlier one-off sweep of 425 single-token mutations (swap `and` and `or`, flip a comparison, turn `break` or
   `continue` into `pass`, flip `True` and `False`) of the code above the self-test left 16 mutants that the
   self-test did not catch. I read all 16. Each is equivalent for valid input, such as `<` to `<=` on an index
   that cannot be zero, or changes only the wording of an error message. An earlier sweep of 437 mutations of
@@ -453,6 +497,15 @@ to anything else. It prints the rule text with table and host names. It does not
   Then `--apply` overwrites the script with the CSV. I reproduced it on Linux with `ln victim.sql hl.sql` and `--out hl.sql --apply`.
 - `--out` with `--apply` overwrites any existing file that is not an input of this run, for example a sibling `.sql` script, without asking.
 - The CSV is opened for writing before it is filled. A disk-full or I/O error part way through leaves a truncated report file, and the tool exits 2.
+- The formula guard covers the six characters listed above. OWASP also lists line feed and the full-width
+  `=`, `+`, `-` and `@`. A cell that starts with one of those is written as it came.
+- OWASP warns that an apostrophe prefix is not reliable in Microsoft Excel after the file is saved and opened
+  again, and names a tab prefix as the Excel-resistant form. No assertion opens Excel or any spreadsheet:
+  the guard is checked on the CSV text only. Treat it as one layer.
+- A cell that already starts with an apostrophe in front of text is written as it came, so `'=x` and a guarded
+  `=x` cannot be told apart in the CSV. The tool never reads the CSV back, so it does not matter here.
+  A consumer that does read it back must know that a leading apostrophe on `path` may be the guard.
+- The guard is applied to the CSV only. The header is fixed by the tool and is not guarded.
 - `safe()` rewrites a non-ASCII path with backslash escapes in the report and in the CSV, so the printed path may not match the real file name.
 - `safe()` escapes only non-ASCII characters. A table, alias or file name that holds a control character or an escape sequence is printed raw,
   so a hostile `.sql` file can put terminal escape codes or fake lines into the report.

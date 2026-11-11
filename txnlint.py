@@ -41,6 +41,7 @@ hold a write, sp_executesql, :r), 64 usage error.
 from __future__ import print_function
 
 import argparse
+import ast
 import collections
 import contextlib
 import csv
@@ -789,12 +790,27 @@ def describe(findings, nfiles, notes=()):
     return lines
 
 
+# A spreadsheet runs a text cell that starts with one of these as a formula.
+_FORMULA_LEAD = tuple("=+-@" + chr(9) + chr(13))
+
+
+def cell(value):
+    """A CSV cell that a spreadsheet will not run as a formula.
+
+    Only text is touched, so the line and batch columns stay numbers. The tool never
+    reads its own CSV, so nothing strips the apostrophe back off.
+    """
+    if isinstance(value, str) and value[:1] in _FORMULA_LEAD:
+        return "'" + value
+    return value
+
+
 def write_findings(path, findings):
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["path", "line", "batch", "rule", "message"])
         for f in findings:
-            w.writerow([safe(f.path), f.line, f.batch, f.rule, f.message])
+            w.writerow([cell(safe(f.path)), f.line, f.batch, f.rule, cell(f.message)])
 
 
 # ------------------------------------------------------------------ self-test
@@ -1475,6 +1491,48 @@ def _run_checks(check, raises, tmp):
     check(code == 1 and rows[0] == ["path", "line", "batch", "rule", "message"]
           and rows[1][1:4] == ["1", "1", "R1"] and len(rows) == 2 and "wrote " in out,
           "--out with --apply writes the header and one row per finding")
+    # ---- the formula guard. A spreadsheet runs a text cell that starts with = + - @
+    # tab or CR as a formula, and a path or a message can carry such a start.
+    leads = (("equals", "="), ("plus", "+"), ("minus", "-"), ("at", "@"),
+             ("tab", chr(9)), ("CR", chr(13)))
+    for lead_name, ch in leads:
+        lead_csv = os.path.join(tmp, "lead_%s.csv" % lead_name)
+        write_findings(lead_csv, [Finding(ch + "evil.sql", 3, 2, "R1", ch + "msg")])
+        with open(lead_csv, newline="") as fh:
+            lead_row = list(csv.reader(fh))[1]
+        check(lead_row == ["'" + ch + "evil.sql", "3", "2", "R1", "'" + ch + "msg"]
+              and ",3,2,R1," in slurp(lead_csv),
+              "a path and a message that start with %s each get one leading apostrophe, "
+              "and line and batch stay bare numbers" % lead_name + PIN)
+    check([cell(v) for v in ("Hydrants", "", "a=b", "x-", " =x", "'=x", BS + "host")]
+          == ["Hydrants", "", "a=b", "x-", " =x", "'=x", BS + "host"]
+          and cell(7) == 7 and isinstance(cell(7), int),
+          "text that does not start with a formula character, and a number, pass through unchanged")
+    cwd_before = os.getcwd()
+    os.chdir(tmp)
+    try:
+        for lead_name, ch in leads[:4]:
+            hostile = ch + "evil.sql"
+            put(hostile, PAIR)
+            lead_csv = os.path.join(tmp, "cli_%s.csv" % lead_name)
+            code, out, err = run_cli(["--out", lead_csv, "--apply", "--", hostile])
+            with open(lead_csv, newline="") as fh:
+                lead_row = list(csv.reader(fh))[1]
+            check(code == 1 and lead_row[0] == "'" + hostile and lead_row[3] == "R1"
+                  and out.startswith("txnlint: ") and (chr(10) + hostile + ":1: R1 ") in out,
+                  "a script named %s: the CSV path is guarded and the console line is not" % lead_name
+                  + PIN)
+    finally:
+        os.chdir(cwd_before)
+    with open(os.path.abspath(__file__), "rb") as fh:
+        tree = ast.parse(fh.read())
+    readers = [n.attr for top in tree.body
+               if isinstance(top, ast.FunctionDef) and top.name not in ("_run_checks", "self_test")
+               for n in ast.walk(top)
+               if isinstance(n, ast.Attribute) and n.attr in ("reader", "DictReader")]
+    check(readers == [] and "_run_checks" in [t.name for t in tree.body
+                                                if isinstance(t, ast.FunctionDef)],
+          "outside the self-test the tool has no csv reader, so no apostrophe needs stripping on read")
     for flag in ("--ap", "--app", "--appl", "--ou", "--unc", "--rule", "--self"):
         check(run_cli([bad, flag])[0] == 64,
               "a unique prefix %s of a long flag is refused with 64" % flag
