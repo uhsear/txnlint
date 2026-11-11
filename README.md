@@ -30,6 +30,8 @@ PASS  a write straight after SET ... ON, with no semicolon, is still a statement
 ...
 PASS  a bare DELETE then an INSERT into the same table is R1
 ...
+PASS  a BEGIN TRANSACTION that an IF or WHILE governs does not make the DELETE safe  <-- pinned defect
+...
 PASS  a ROLLBACK in an early-exit branch does not end the transaction for the code after it  <-- pinned defect
 ...
 PASS  SET XACT_ABORT ON with two bare writes is R2
@@ -42,7 +44,13 @@ PASS  a THROW guard in one batch and a DELETE in the next is R5
 ...
 PASS  a RAISERROR guard and a write in the same batch is R5, because the batch goes on  <-- pinned defect
 ...
+PASS  a write in the ELSE of an IF whose branch is a RAISERROR cannot run when it fires  <-- pinned defect
+...
 PASS  a listed host needs exactly two backslashes, in any case
+...
+PASS  an R6 message about an unlisted host does not print it, because it may be a secret  <-- pinned defect
+...
+PASS  UTF-16 without a BOM file exits 2 and names the cause, and does not report it clean  <-- pinned defect
 ...
 PASS  a script made only of dynamic SQL exits 3, not the 0 that means clean  <-- pinned defect
 ...
@@ -55,10 +63,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-187 assertions, 0 failed
+204 assertions, 0 failed
 ```
 
-The full run prints all 187 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 204 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -256,6 +264,10 @@ unconditional `RETURN`, `GOTO` or `THROW`. That keeps the early-exit idiom
 ends the transaction, including `IF @@ERROR <> 0 ROLLBACK TRAN` with no exit: the code after it also runs on the
 path that rolled back, outside any transaction, so a `DELETE` and `INSERT` there are reported. R1 does not report a
 `DELETE` or `TRUNCATE` of a temp table or table variable.
+A `BEGIN TRANSACTION` that an `IF` or `WHILE` governs, such as `IF @UseTran = 1 BEGIN TRANSACTION`, opens a
+transaction on one path only. The tool does not count it, so the `DELETE` after it is reported. A condition that reads
+`@@TRANCOUNT` or `XACT_STATE()` is the exception: `IF @@TRANCOUNT = 0 BEGIN TRANSACTION` leaves a transaction open on
+every path, because the other path already had one.
 
 **R2. `SET XACT_ABORT ON`, with two or more writes outside any transaction.** `XACT_ABORT` rolls back
 the transaction that a run-time error finds. With no open transaction, each write has already committed.
@@ -265,7 +277,7 @@ transaction.
 
 **R3. A write in a `CATCH` block before the `ROLLBACK` that follows it.** After an error, a transaction
 can be uncommittable, and it can then run only reads and a `ROLLBACK`. If it is still committable, the
-`ROLLBACK` that follows undoes the write. Either way the log row is lost. A table variable survives a
+`ROLLBACK` that follows undoes the write. In both cases the log row is lost while the transaction is still open. A table variable survives a
 `ROLLBACK`, so a write to one is not reported. A `CATCH` that tests `XACT_STATE()` before it writes is
 assumed to branch on the answer, and it is not reported. Fix: put `ROLLBACK` first, then log.
 
@@ -286,10 +298,15 @@ is to follow it with `RETURN`, or to use `THROW`; moving the check next to the w
 a guard. A guard in a `TRY` block is not a guard, because it jumps to `CATCH`. R5 also reads procedure bodies,
 where only the same-batch `RAISERROR` case can occur.
 
+A write in the `ELSE` branch of the `IF` that holds the `RAISERROR` is not reported for that guard, because the
+`ELSE` does not run when the guard fires: `IF @x = 0 RAISERROR(...) ELSE DELETE FROM dbo.Lookup;`. This holds when
+the `RAISERROR` is in a `BEGIN`/`END` block under the `IF`, when the `ELSE` holds an `IF` chain or a block, and
+through every enclosing `IF` block. A write after the whole `IF ... ELSE` still runs, and is still reported.
+
 **R6. A UNC path with the wrong number of leading backslashes.** It runs only when you name hosts with
 `--unc-host`. A path to a listed host that starts with one, three or four backslashes is reported. So is a
 path with exactly two backslashes to a host that is not on the list, which catches a mistyped host. The
-rule reads string literals, including SQL inside SQL, and ignores comments. It prints the host name and the backslash count, never the rest of the path.
+rule reads string literals, including SQL inside SQL, and ignores comments. It prints the backslash count and the name of a listed host, never an unlisted host name from the script and never the rest of the path.
 Without the list the tool cannot tell a lost backslash from a real root-relative path such as `\Windows\Temp`,
 so R6 is off, and the first line of the output says so. `--rules R6` without a host is a usage error.
 A listed short name also covers its fully qualified form: with `--unc-host backupsrv`, a two-backslash path to
@@ -336,6 +353,9 @@ as given. Before this guard, a script named `=evil.sql` reached the file as a ce
 - The tool never reads its own CSV. No code outside the self-test calls `csv.reader`, and an assertion
   parses the source to show that. So no strip-on-read exists to get wrong.
   A consumer that joins on `path` must strip one leading apostrophe itself.
+
+Create `=evil.sql` first, with a `DELETE FROM dbo.lookup` and an `INSERT INTO dbo.lookup` in it and no
+transaction. If the file does not exist, the run exits 2 with `No such file`.
 
 ```
 $ python txnlint.py --out findings.csv --apply -- =evil.sql
@@ -386,15 +406,17 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | Verbs in MERGE, DDL, grants, hints, strings and comments are not writes | "the UPDATE, DELETE and INSERT inside a MERGE", "verbs inside DDL, grants, hints, strings and comments", "every ON DELETE and ON UPDATE action" |
 | A write straight after `SET ... ON` is a statement even with no semicolon | "a write straight after SET ... ON", "a bare pair straight after SET ... ON", "R2 counts writes that follow SET XACT_ABORT ON" |
 | A sqlcmd `$(variable)` is part of a name | "a sqlcmd $(variable) is part of a name", "a table named through a sqlcmd variable" |
+| A `BEGIN TRANSACTION` under an `IF` or `WHILE` does not count, unless the condition reads `@@TRANCOUNT` or `XACT_STATE()` | "a BEGIN TRANSACTION that an IF or WHILE governs", "IF @@TRANCOUNT = 0 BEGIN TRANSACTION, the XACT_STATE() form and a plain block", "an ELSE with no IF before it" |
 | R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs" |
 | A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
 | R2 sees `XACT_ABORT` across `GO` and ignores scratch tables | "SET XACT_ABORT ON with two bare writes", "XACT_ABORT set in one batch", "inside a procedure only its own SET counts", "scratch writes do not count", "R2 points at the SET", "R2 lists five lines" |
 | R3 reports a write before the `ROLLBACK`, and spares the safe shapes | "a log INSERT in CATCH", "the same CATCH with the ROLLBACK first", "a table variable survives ROLLBACK", "a CATCH that tests XACT_STATE", "a write before the XACT_STATE test", "a CATCH that commits and never rolls back", "a stray END TRY opens no transaction" |
 | R5 reports a THROW guard and a later write, and honours `:on error` and `TRY` | "a THROW guard in one batch", ":on error exit silences R5", "a THROW in TRY jumps to CATCH", "each guard is reported once", "a later batch with a guard of its own", "the innermost TRY decides", "a guard in a block inside TRY" |
+| A write in the `ELSE` of the `IF` that holds a `RAISERROR` is not reported for it, and a write after the `IF` still is | "a write in the ELSE of an IF whose branch is a RAISERROR", "the same holds when the RAISERROR is in a BEGIN block", "an ELSE IF chain, a WHILE, a nested IF", "a write after the whole IF and ELSE", "the skipped branch ends at a GO", "a skipped branch is marked on and off" |
 | R5 reads `RAISERROR` as a message that ends nothing, unless a `RETURN` follows | "RAISERROR is a guard at severity 11", "a RAISERROR guard and a write in the same batch", "a RETURN or GOTO in the same block", "a RETURN that is conditional", ":on error exit, a THROW, a RAISERROR in TRY", "a RAISERROR severity is read after an IF condition", "the advice differs", "a comma inside a nested call" |
-| R6 counts backslashes for a listed host and never prints the path | "a listed host needs exactly two backslashes", "a listed short host also covers its fully qualified name", "a two-backslash path to an unlisted host", "an R6 message names the host and the count and never prints the path", "a path inside dynamic SQL", "a bracketed name or a bare word" |
-| `--unc-host` turns R6 on, and nothing after the host name of a path reaches the output or the CSV (the host name does, and so does the count of backslashes) | "--unc-host turns R6 on, and nothing after the host name reaches the output or the CSV" |
+| R6 counts backslashes for a listed host and never prints the path or an unlisted host name | "a listed host needs exactly two backslashes", "a listed short host also covers its fully qualified name", "a two-backslash path to an unlisted host", "an R6 message about a listed host names the host and never prints the path", "an R6 message about an unlisted host does not print it", "an R6 message about a listed short name prints the listed name", "a path inside dynamic SQL", "a bracketed name or a bare word" |
+| `--unc-host` turns R6 on, and neither the host name of a path nor anything after it reaches the output or the CSV | "--unc-host turns R6 on, and nothing after the host name reaches the output or the CSV" |
 | The default run leaves R6 off and says so | "a clean file exits 0 and says which rules ran and that R6 is off", "a bad UNC path passes while R6 is off" |
 | Code that is not read gives a note and exit 3 | "EXEC of a string with a write or a variable", "a note says what was not read", "a procedure call, a harmless string", "a procedure run after an unprotected DELETE or TRUNCATE is a note", "no note for a procedure before the delete", "the gate gives 3", "a script made only of dynamic SQL exits 3", "a finding wins over a note", "a run with only R6" |
 | A path or message that starts with `=`, `+`, `-`, `@`, a tab or a CR is written with one leading apostrophe, and `line` and `batch` stay numbers | six assertions "a path and a message that start with equals", "plus", "minus", "at", "tab" and "CR" (each writes a CSV with `write_findings`, reads it back with `csv.reader` and checks the raw text) |
@@ -404,19 +426,20 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | `--out` writes only with `--apply`, and never over an input | "--out without --apply writes nothing", "--out with --apply writes the header", "--out naming an input script is refused" |
 | A prefix of any long flag is refused with 64 | seven assertions, "a unique prefix --ap", "--app", "--appl", "--ou", "--unc", "--rule", "--self", and "--ap next to --out writes nothing" |
 | UTF-16, UTF-8 with a byte order mark and cp1252 scripts are read | "UTF-16 either way round", "a UTF-16 script with a byte order mark", "a broken UTF-16 file exits 2" |
+| A file with a NUL in its text (UTF-16 with no byte order mark, or UTF-32) exits 2 and is never reported clean | "UTF-16 without a BOM is refused", "UTF-32 with a BOM is refused", "UTF-16 without a BOM file exits 2", "UTF-32 file exits 2" |
 | A folder run and the exit codes 0, 1, 2, 3 and 64 | "a folder is walked in sorted order", "a folder that cannot be listed exits 2", "a folder with no .sql file exits 2", "a file that cannot be read exits 2", "a report that cannot be written exits 2", "no path is a usage error" |
 | A non-ASCII name prints as ASCII escapes | "a non-ASCII table name prints as ASCII escapes" |
 | The harness can fail | the two `pinned defect` probes of `check()`, `raises()` and the footer |
 
 There is no network code in this tool, so there is no stub server. It opens no connection to SQL Server or
-to anything else. It prints the rule text with table and host names. It does not print string contents, except the host name that R6 reads out of a UNC path (see Limits).
+to anything else. It prints the rule text with table names and, for R6, the name of a host from your `--unc-host` list. It does not print string contents.
 
 ## Measured
 
-- Branch coverage is 100 percent: 969 statements and 380 branches, measured with
+- Branch coverage is 100 percent: 1085 statements and 448 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 187 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 204 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.10.20, 3.12.10 and 3.13.2 on Windows, and Python 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain. Python 3.11 was not run in this round. An earlier round ran
@@ -475,6 +498,14 @@ to anything else. It prints the rule text with table and host names. It does not
   it is read as outside the transaction. The tool does not follow a `GOTO` to its label.
 - A `RAISERROR` counts as a guard that stops the code after it only if a `RETURN` or `GOTO` follows in the same
   block before any write. A script that sets a flag and tests the flag later is reported anyway.
+- The `ELSE` of a `RAISERROR` guard ends at its statement or block. A plain statement with no semicolon ends at the
+  next statement word, so an `ELSE INSERT ... SELECT` ends at its `SELECT`. A block that never closes, or that
+  spans a `GO`, is not matched, and the writes in it are reported.
+- An `ELSE` after an `IF` that tests `@@TRANCOUNT` is judged by the nearest earlier `IF`. With nested `IF` statements the
+  tool can pair the wrong one.
+- A `:on error exit` that sits after an R5 guard but before the `GO` that ends its batch is still reported.
+- R3 also reports a log write in a `CATCH` when the `TRY` had already committed and the error came later. The tool does
+  not follow which statement threw, so that report is cautious, and the row is not lost in that case.
 - After `SET IMPLICIT_TRANSACTIONS ON` the tool treats every later write as inside a transaction, even after a
   `COMMIT`, so a `DELETE`, `COMMIT`, `INSERT` sequence is not reported.
 - Cross-database names match on their tail, so `DELETE FROM dbo.Lookup` and `INSERT INTO OtherDb.dbo.Lookup`
@@ -489,8 +520,8 @@ to anything else. It prints the rule text with table and host names. It does not
   SQL Server would not parse such a script.
 - R1 compares every unprotected `DELETE` with every later `INSERT`. A script with 4000 `DELETE`s and 4000 `INSERT`s on
   different tables took about 10 seconds in my run.
-- R6 prints the name that follows a double backslash in a string, so a password written in that position
-  (`'Pwd=\\hunter2\x'`) would reach the report and the CSV. Nothing else in a string is printed.
+- R6 prints only a host name from your `--unc-host` list. It says that an unlisted host was named, and the line
+  number points to the string. The report no longer shows which host, so read the script line.
 - R6 needs a backslash after the host, so `'\\rogue'` with no share is not read, even when `rogue` is not listed.
 - R2 and R5 skip a write to a temp table (`#name`) or table variable (`@name`). A guard followed by `INSERT INTO #stage`
   in a later batch is not reported, although that write runs.
@@ -511,8 +542,10 @@ to anything else. It prints the rule text with table and host names. It does not
 - Only `.sql` files are picked up from a folder. A file named on the command line is read whatever its extension.
 - A script is decoded as UTF-16 when it starts with a byte order mark, as UTF-8 otherwise, and as cp1252
   when the UTF-8 decode fails.
-- A UTF-16 or UTF-32 script with no byte order mark is decoded as UTF-8. Its NUL bytes hide every keyword, and the file passes as clean with exit 0.
+- A script whose decoded text holds a NUL character is refused with exit 2. That covers UTF-16 with no byte order
+  mark and UTF-32 with or without one. Save such a file as UTF-8, or as UTF-16 with a byte order mark.
 - A zero-byte or BOM-only `.sql` file is reported as `0 finding(s)` with exit 0, so a truncated deployment script looks clean.
+  Check file sizes before you trust exit 0.
 - The only procedure calls that give a note are those after an unprotected `DELETE` or `TRUNCATE`. A procedure that
   deletes and refills inside its own body is another script. Lint that script on its own.
 - A double-quoted string, which is a string only when `QUOTED_IDENTIFIER` is off, is read as a name.
@@ -532,6 +565,10 @@ to anything else. It prints the rule text with table and host names. It does not
   code 3. This holds for a run with `--apply`.
 - A run that fails with exit 2 before it writes leaves an older `--out` file untouched. A caller that reads only the file
   sees the result of the previous run.
+- A header-only CSV does not mean clean, so check the exit code or the console note count.
+- Write the report outside the folder you scan, or give it a name that does not end in `.sql`. A report named
+  `d/rep.sql` inside a scanned folder `d` is read as a script by the next run and counted as an extra file. Only the
+  exact inputs of the current run are refused.
 - The demo scripts are printed in this README only. Create them by hand to repeat the sample runs.
 - Messages start with fixed tool text (a verb, a rule phrase, `EXEC`), so in practice only `path` can start with a
   formula character: a hostile folder argument or a file named on the command line. The guard on `message` is a second layer.
@@ -555,6 +592,7 @@ to anything else. It prints the rule text with table and host names. It does not
   `TypeError` in the assertion list, not by a named assertion. `cell()` is called only with path and message strings.
 - E0 exits 1, the same code as an ordinary finding. A caller must read the output to tell an unreadable file from a rule that fired.
 - An unexpected internal error exits 1 with a Python traceback, the same code as "findings exist". `main()` has no catch-all that maps a crash to its own code.
+  A 20,000-program random token run in this round raised no exception. The driver is not in this repository, so you cannot repeat it from here.
 
 ## Contributing
 

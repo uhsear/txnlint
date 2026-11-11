@@ -58,7 +58,8 @@ ALL_RULES = ("R1", "R2", "R3", "R5", "R6")
 PIN = "  <-- pinned defect"
 
 Tok = collections.namedtuple("Tok", "kind val u line batch")
-Ev = collections.namedtuple("Ev", "kind line batch name extra ctx")
+Ev = collections.namedtuple("Ev", "kind line batch name extra ctx ref")
+Ev.__new__.__defaults__ = (None,)
 Finding = collections.namedtuple("Finding", "path line batch rule message")
 
 _EOF = Tok("e", "", "", 0, 0)
@@ -331,11 +332,11 @@ def raise_is_guard(toks, k):
     return int(sev[0].val) >= 11
 
 
-def governed_by_if(toks, k):
-    """True when the statement at k is the body of an IF, ELSE or WHILE with no BEGIN.
+def governing(toks, k):
+    """Index of the IF, ELSE or WHILE whose body is the statement at k, or -1.
 
-    Also true when k is a BEGIN that opens the body of one. The search runs back
-    to the start of the statement and skips parenthesised conditions.
+    The body has no BEGIN of its own, or k is the BEGIN that opens it. The search
+    runs back to the start of the statement and skips parenthesised conditions.
     """
     depth, j = 0, k - 1
     while j >= 0 and toks[j].batch == toks[k].batch:
@@ -346,15 +347,133 @@ def governed_by_if(toks, k):
             depth = max(0, depth - 1)
         elif depth == 0:
             if is_p(t, ";"):
-                return False
+                return -1
             if t.kind == "w":
                 if t.u in ("IF", "ELSE", "WHILE"):
-                    return True
+                    return j
                 # UPDATE(col) in a trigger is a function that an IF may test.
                 if t.u in _STMT_WORDS and not (t.u == "UPDATE" and is_p(at(toks, j + 1), "(")):
-                    return False
+                    return -1
         j -= 1
-    return False
+    return -1
+
+
+def governed_by_if(toks, k):
+    """True when the statement at k is the body of an IF, ELSE or WHILE with no BEGIN.
+
+    Also true when k is a BEGIN that opens the body of one.
+    """
+    return governing(toks, k) >= 0
+
+
+def tests_state(toks, k):
+    """True when the condition that governs k reads @@TRANCOUNT or XACT_STATE().
+
+    IF @@TRANCOUNT = 0 BEGIN TRANSACTION opens a transaction on every path, because the
+    other path already has one. An ELSE is judged by the nearest IF before it.
+    shortcut: that IF is the nearest earlier one, and a nested IF can pair the wrong one.
+    """
+    j = governing(toks, k)
+    if toks[j].u == "ELSE":
+        j = max([i for i in range(j) if toks[i].u == "IF" and toks[i].batch == toks[j].batch],
+                default=j)
+    return any(t.u in ("@@TRANCOUNT", "XACT_STATE") for t in toks[j:k])
+
+
+def pair_ends(toks):
+    """Map the index of each BEGIN block and CASE to the index just after its END.
+
+    A block that is still open at a GO is dropped, because T-SQL needs the END in the
+    same batch.
+    """
+    ends, opens = {}, []
+    for j, t in enumerate(toks):
+        if t.kind != "w":
+            continue
+        if opens and toks[opens[-1]].batch != t.batch:
+            opens.clear()
+        if t.u == "CASE" or (t.u == "BEGIN" and at(toks, j + 1).u not in _TRAN_BEGIN):
+            opens.append(j)
+        elif t.u == "END" and opens:
+            ends[opens.pop()] = j + 1 + (at(toks, j + 1).u in ("TRY", "CATCH"))
+    return ends
+
+
+def simple_end(toks, i):
+    """Index after the statement that starts at i and is not an IF, WHILE or block.
+
+    It ends after a semicolon, or before the next statement word, ELSE or END at the
+    top level of parentheses.
+    """
+    batch, depth, j = toks[i].batch, 0, i + 1
+    while j < len(toks) and toks[j].batch == batch:
+        t = toks[j]
+        if is_p(t, "("):
+            depth += 1
+        elif is_p(t, ")"):
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            if is_p(t, ";"):
+                return j + 1
+            if t.u in ("ELSE", "END", "IF", "WHILE") or (
+                    t.u in _STMT_WORDS and not (t.u == "UPDATE" and is_p(at(toks, j + 1), "("))):
+                return j
+        j += 1
+    return j
+
+
+def stmt_end(toks, i, ends):
+    """Index after the whole statement that starts at i, with its ELSE branches.
+
+    An IF, a WHILE, a BEGIN block and a plain statement each count as one statement.
+    shortcut: a plain statement with no semicolon ends at the next statement word, so
+    INSERT ... SELECT ends at its SELECT. That is enough to bound an ELSE branch.
+    """
+    batch, open_ifs = at(toks, i).batch, 0
+    while True:
+        t = at(toks, i)
+        if t.kind == "e" or t.batch != batch:
+            return i
+        if t.u in ("IF", "WHILE"):
+            open_ifs += t.u == "IF"
+            depth, i = 0, i + 1
+            while i < len(toks) and toks[i].batch == batch:
+                if is_p(toks[i], "("):
+                    depth += 1
+                elif is_p(toks[i], ")"):
+                    depth = max(0, depth - 1)
+                elif depth == 0 and toks[i].u in _STMT_WORDS and not (
+                        toks[i].u == "UPDATE" and is_p(at(toks, i + 1), "(")):
+                    break
+                i += 1
+            continue
+        if t.u == "BEGIN" and at(toks, i + 1).u not in _TRAN_BEGIN:
+            i = ends.get(i, i + 1)
+        else:
+            i = simple_end(toks, i)
+        if open_ifs and at(toks, i).u == "ELSE":
+            open_ifs, i = open_ifs - 1, i + 1
+            continue
+        return i
+
+
+def skipped_branches(toks, k, stack, ends):
+    """Token ranges (start, end) of the ELSE branches that a RAISERROR at k skips.
+
+    The RAISERROR is the body of an IF, or sits in a BEGIN block that is. When it fires,
+    the ELSE of that IF does not run. The search climbs through every enclosing block.
+    """
+    out, spots = [], []
+    j = governing(toks, k)
+    if j >= 0 and toks[j].u == "IF":
+        spots.append(stmt_end(toks, k, ends))
+    for kind, b in stack:
+        if kind == "cblock" and toks[governing(toks, b)].u == "IF":
+            spots.append(ends.get(b, -1))
+    for e in spots:
+        if at(toks, e).u == "ELSE":
+            out.append((e, stmt_end(toks, e + 1, ends)))
+    return out
 
 
 def leaves_batch(toks, k, words=("RETURN", "GOTO"), stop_at_write=True):
@@ -412,41 +531,52 @@ def unread(toks):
 def scan(toks):
     """Turn tokens into the events the rules read, in file order."""
     evs, stack = [], []
+    ends, shield_on, shield_off = pair_ends(toks), {}, {}
     for k, t in enumerate(toks):
+        for g in shield_off.get(k, ()):
+            evs.append(Ev("shield", t.line, t.batch, "off", None, "", g))
+        for g in shield_on.get(k, ()):
+            evs.append(Ev("shield", t.line, t.batch, "on", None, "", g))
         if t.kind == "c":
             evs.append(Ev("sqlcmd", t.line, t.batch, "", t.val == "exit", ""))
             continue
         if t.kind != "w":
             continue
         ctx = ""
-        for s in reversed(stack):
+        for s, _ in reversed(stack):
             if s in ("try", "catch"):
                 ctx = s
                 break
 
-        def add(kind, name="", extra=None):
-            evs.append(Ev(kind, t.line, t.batch, name, extra, ctx))
+        def add(kind, name="", extra=None, ref=None):
+            evs.append(Ev(kind, t.line, t.batch, name, extra, ctx, ref))
 
         nxt = at(toks, k + 1)
         if t.u == "BEGIN":
             if nxt.u == "TRY":
-                stack.append("try")
+                stack.append(("try", k))
                 add("try")
             elif nxt.u == "CATCH":
-                stack.append("catch")
+                stack.append(("catch", k))
                 add("catch")
             elif nxt.u in _TRAN_BEGIN:
-                add("begin")
+                # extra is True when the transaction opens on one path only, as in
+                # IF @UseTran = 1 BEGIN TRANSACTION.
+                if governed_by_if(toks, k):
+                    cond = not tests_state(toks, k)
+                else:
+                    cond = any(s == "cblock" and not tests_state(toks, i) for s, i in stack)
+                add("begin", "", cond)
             elif governed_by_if(toks, k):
-                stack.append("cblock")
+                stack.append(("cblock", k))
             else:
-                stack.append("block")
+                stack.append(("block", k))
         elif t.u == "CASE":
-            stack.append("case")
+            stack.append(("case", k))
         elif t.u == "END":
             if nxt.u in ("TRY", "CATCH"):
                 want = nxt.u.lower()
-                while stack and stack.pop() != want:
+                while stack and stack.pop()[0] != want:
                     pass
                 add("end" + want)
             elif stack:
@@ -461,8 +591,8 @@ def scan(toks):
             # both ways, so it ends the transaction on the path that rolled back.
             cond = governed_by_if(toks, k)
             leaves = False
-            if cond or "cblock" in stack:
-                leaves = leaves_batch(toks, k, _EXITS, cond or stack[-1] != "cblock")
+            if cond or any(s == "cblock" for s, _ in stack):
+                leaves = leaves_batch(toks, k, _EXITS, cond or stack[-1][0] != "cblock")
             add("rollback", at(toks, k + 2).val.lower() if nxt.u in _TRAN_WORDS else "", leaves)
         elif t.u == "SAVE" and nxt.u in _TRAN_WORDS:
             add("save", at(toks, k + 2).val.lower())
@@ -472,8 +602,13 @@ def scan(toks):
             add("guard", "THROW", False)
         elif t.u == "RAISERROR":
             if raise_is_guard(toks, k):
-                # extra is True when the statements after the RAISERROR still run.
-                add("guard", "RAISERROR", not leaves_batch(toks, k))
+                # extra is True when the statements after the RAISERROR still run. The
+                # ELSE branch of the IF that holds it does not run when it fires, so
+                # shield events mark that branch and R5 skips the guard inside it.
+                add("guard", "RAISERROR", not leaves_batch(toks, k), k)
+                for a, b in skipped_branches(toks, k, stack, ends):
+                    shield_on.setdefault(a, []).append(k)
+                    shield_off.setdefault(b, []).append(k)
         elif t.u == "SET":
             if nxt.u in ("XACT_ABORT", "IMPLICIT_TRANSACTIONS") and \
                     at(toks, k + 2).u in ("ON", "OFF"):
@@ -541,7 +676,7 @@ def walk(evs):
     for e in evs:
         yield e, depth > 0 or implicit
         if e.kind == "begin":
-            depth += 1
+            depth += not e.extra
         elif e.kind == "commit":
             depth = max(0, depth - 1)
         elif e.kind == "rollback" and not e.extra:
@@ -644,15 +779,20 @@ def rule_r5(evs):
     RETURN or GOTO follows the RAISERROR first (the guard event says so in extra).
     A guard is reported once, at the first write it fails to stop.
     """
-    pending, exit_on, out = [], False, []
+    pending, exit_on, shielded, out = [], False, set(), []
     for e in evs:
         if e.kind == "sqlcmd":
             exit_on = e.extra
+        elif e.kind == "shield":
+            (shielded.add if e.name == "on" else shielded.discard)(e.ref)
         elif e.kind == "guard" and e.ctx != "try" and not exit_on:
             pending.append(e)
         elif e.kind == "write" and not is_scratch(e.name):
             keep = []
             for g in pending:
+                if g.ref in shielded:
+                    keep.append(g)
+                    continue
                 target = "%s on %s" % (e.extra, safe(e.name or "?"))
                 if g.batch < e.batch:
                     fix = ("move the check into the batch that writes"
@@ -683,16 +823,18 @@ def rule_r6(toks, hosts):
             continue
         for m in _UNC_RE.finditer(t.val):
             count, host = len(m.group(1)), m.group(2).lower()
-            # A listed short name also covers its fully qualified form.
-            listed = host in hosts or any(host.startswith(h + ".") for h in hosts)
+            # A listed short name also covers its fully qualified form. Only the listed
+            # name is printed, never the text from the script.
+            listed = max([h for h in hosts if host == h or host.startswith(h + ".")],
+                         key=len, default="")
             if listed and count not in (0, 2):
                 out.append((t.line, t.batch,
                             "a path to host %s starts with %d backslash(es). A UNC path "
-                            "starts with exactly 2." % (safe(host), count)))
+                            "starts with exactly 2." % (safe(listed), count)))
             elif not listed and count == 2:
+                # The host is not printed: a secret can sit in that position of a string.
                 out.append((t.line, t.batch,
-                            "a UNC path names host %s, which is not on the --unc-host list."
-                            % safe(host)))
+                            "a UNC path names a host that is not on the --unc-host list."))
     return out
 
 
@@ -779,13 +921,23 @@ def parse_hosts(values):
 # ------------------------------------------------------------------- file IO
 
 def decode_sql(raw):
-    """SQL text from bytes. A UTF-16 byte order mark decides; otherwise UTF-8, then cp1252."""
+    """SQL text from bytes. A UTF-16 byte order mark decides; otherwise UTF-8, then cp1252.
+
+    A NUL in the text raises UnicodeError: the tool cannot read the file, so it must not
+    report it clean.
+    """
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return raw.decode("utf-16")
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("cp1252", errors="replace")
+        text = raw.decode("utf-16")
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("cp1252", errors="replace")
+    # No T-SQL script holds a NUL. One here means UTF-16 without a BOM, or UTF-32.
+    if "\x00" in text:
+        raise UnicodeError("the file holds NUL characters, so it is not UTF-8 text. "
+                           "Save it as UTF-8, or as UTF-16 with a byte order mark.")
+    return text
 
 
 def read_sql(path):
@@ -1149,6 +1301,29 @@ def _run_checks(check, raises, tmp):
           "a table named through a sqlcmd variable is read: the same variable is R1, two are not"
           + PIN)
 
+    # ---- a BEGIN TRANSACTION under an IF opens a transaction on one path only
+    sure = S("IF @UseTran = 1 BEGIN TRANSACTION;", PAIR, "IF @UseTran = 1 COMMIT;")
+    check(lint(sure) == [("R1", 2)]
+          and lint(S("IF @UseTran = 1 BEGIN", "BEGIN TRANSACTION;", "END", PAIR, "COMMIT;"))
+          == [("R1", 4)]
+          and lint(S("IF @a = 1 BEGIN", "BEGIN", "BEGIN TRANSACTION;", "END", "END", PAIR,
+                     "COMMIT;")) == [("R1", 6)]
+          and lint(S("WHILE @i < 3 BEGIN TRANSACTION;", PAIR, "COMMIT;")) == [("R1", 2)],
+          "a BEGIN TRANSACTION that an IF or WHILE governs does not make the DELETE safe" + PIN)
+    check(lint(S("IF @@TRANCOUNT = 0 BEGIN TRANSACTION;", PAIR, "COMMIT;")) == []
+          and lint(S("IF @@TRANCOUNT = 0 BEGIN", "BEGIN TRANSACTION;", "END", PAIR, "COMMIT;"))
+          == []
+          and lint(S("IF XACT_STATE() = 0 BEGIN TRANSACTION;", PAIR, "COMMIT;")) == []
+          and lint(S("IF @@TRANCOUNT > 0 SAVE TRANSACTION sp", "ELSE BEGIN TRANSACTION;", PAIR,
+                     "COMMIT;")) == []
+          and lint(S("IF @a = 1 PRINT 1;", "IF @@TRANCOUNT > 0 SAVE TRANSACTION sp",
+                     "ELSE BEGIN TRANSACTION;", PAIR, "COMMIT;")) == []
+          and lint(S("BEGIN", "BEGIN TRANSACTION;", "END", PAIR, "COMMIT;")) == [],
+          "IF @@TRANCOUNT = 0 BEGIN TRANSACTION, the XACT_STATE() form and a plain block "
+          "still open a transaction on every path")
+    check(lint(S("ELSE BEGIN TRANSACTION;", PAIR, "COMMIT;")) == [("R1", 2)],
+          "an ELSE with no IF before it is judged by its own text, and is conditional")
+
     # ---- R2: XACT_ABORT ON with writes that run outside any transaction
     two = S("UPDATE dbo.A SET x = 1;", "UPDATE dbo.B SET y = 1;")
     check(lint(S("SET XACT_ABORT ON;", two)) == [("R2", 1)],
@@ -1386,6 +1561,62 @@ def _run_checks(check, raises, tmp):
           and "does not stop its batch" in same_r and "RETURN, or use THROW." in same_r,
           "the advice differs: THROW ends its batch, and a RAISERROR needs a RETURN" + PIN)
 
+    # ---- R5: the ELSE branch of an IF that holds a RAISERROR does not run when it fires
+    raise_ = "RAISERROR(N'bad input', 16, 1)"
+
+    def r5(*lines):
+        return lint(S(*lines), ("R5",))
+
+    check(r5("IF @x = 0 " + raise_, "ELSE DELETE FROM dbo.T;") == []
+          and r5("IF @x = 0 " + raise_ + "; ELSE DELETE FROM dbo.T;") == []
+          and r5("IF @x = 0 RAISERROR 50001 'x' ELSE DELETE FROM dbo.T;") == []
+          and r5("IF @x = 0 " + raise_ + " WITH NOWAIT", "ELSE DELETE FROM dbo.T;") == [],
+          "a write in the ELSE of an IF whose branch is a RAISERROR cannot run when it fires"
+          + PIN)
+    check(r5("IF @x = 0 BEGIN", raise_ + ";", "END", "ELSE BEGIN", "DELETE FROM dbo.T;", "END")
+          == []
+          and r5("BEGIN TRANSACTION;", "IF NOT EXISTS (SELECT 1 FROM dbo.S)", "BEGIN", raise_ + ";",
+                 "END", "ELSE", "BEGIN", "DELETE FROM dbo.T;",
+                 "INSERT INTO dbo.T (a) SELECT a FROM dbo.S;", "END", "COMMIT;") == []
+          and r5("IF @x = 0 BEGIN", raise_ + ";", "END", "ELSE DELETE FROM dbo.T;") == [],
+          "the same holds when the RAISERROR is in a BEGIN block and the ELSE is a block or not"
+          + PIN)
+    check(r5("IF @x = 0 " + raise_, "ELSE IF @y = 1 DELETE FROM dbo.T;",
+             "ELSE DELETE FROM dbo.U;") == []
+          and r5("IF @x = 0 " + raise_, "ELSE WHILE @y = 1 DELETE FROM dbo.T;") == []
+          and r5("IF @x = 0 " + raise_, "ELSE IF UPDATE(a) DELETE FROM dbo.T;") == []
+          and r5("IF @a = 1 BEGIN", "IF @b = 1 " + raise_, "ELSE DELETE FROM dbo.T;", "END",
+                 "ELSE DELETE FROM dbo.U;") == []
+          and r5("IF @a = 1 BEGIN", "BEGIN", raise_ + ";", "END", "END", "ELSE DELETE FROM dbo.U;")
+          == [],
+          "an ELSE IF chain, a WHILE, a nested IF and a nested block are all skipped when it fires")
+    check(r5("IF @x = 0 " + raise_, "DELETE FROM dbo.T;") == [("R5", 1)]
+          and r5("IF @x = 0 " + raise_, "ELSE PRINT 1;", "DELETE FROM dbo.T;") == [("R5", 1)]
+          and r5("IF @x = 0 PRINT 1;", "ELSE " + raise_, "DELETE FROM dbo.T;") == [("R5", 2)]
+          and r5("IF @x = 0 BEGIN", raise_ + ";", "END", "ELSE PRINT 1;", "DELETE FROM dbo.T;")
+          == [("R5", 2)]
+          and r5("IF @a = 1 BEGIN", "IF @b = 1 " + raise_, "ELSE PRINT 1;", "END",
+                 "DELETE FROM dbo.T;") == [("R5", 2)],
+          "a write after the whole IF and ELSE, or after a RAISERROR with no ELSE, is still R5")
+    check(r5("IF @x = 0 " + raise_, "ELSE DELETE FROM dbo.T;", "GO", "DELETE FROM dbo.U;")
+          == [("R5", 1)]
+          and r5("IF @x = 0 " + raise_, "ELSE DELETE FROM dbo.T;", "DELETE FROM dbo.U;")
+          == [("R5", 1)]
+          and r5("IF @x = 0 " + raise_, "ELSE") == []
+          and r5("IF @x = 0 " + raise_, "ELSE IF @y = 1") == []
+          and r5("IF @x = 0 BEGIN", raise_, "GO", "END", "ELSE DELETE FROM dbo.T;")
+          == [("R5", 2)]
+          and r5("IF @x = 0 " + raise_, "ELSE BEGIN DELETE FROM dbo.T;") == [("R5", 1)]
+          and r5("IF @x = 0 " + raise_, "ELSE BEGIN DELETE FROM dbo.T;", "GO",
+                 "DELETE FROM dbo.U;") == [("R5", 1)],
+          "the skipped branch ends at a GO and at the end of input, and a block that never "
+          "closes or that spans a GO is not matched, so its writes are reported")
+    check([e.name for e in scan(tokenize("IF @x = 0 " + raise_ + " ELSE PRINT 1; SELECT 2")[0])
+           if e.kind == "shield"] == ["on", "off"]
+          and lint(S("IF @x = 0 " + raise_ + " ELSE PRINT 1;", "BEGIN TRY", "SELECT 1;",
+                     "END TRY", "BEGIN CATCH", "SELECT 2;", "END CATCH")) == [],
+          "a skipped branch is marked on and off, and TRY and CATCH ends are read")
+
     # ---- R6: the UNC rule, with a host list
     hosts = {"backupsrv"}
 
@@ -1421,7 +1652,17 @@ def _run_checks(check, raises, tmp):
                       ("R6",), hosts)
     check(len(found) == 1 and "hunter2" not in found[0].message
           and "secret" not in found[0].message,
-          "an R6 message names the host and the count and never prints the path")
+          "an R6 message about a listed host names the host and never prints the path")
+    found = lint_text(q(unc(1, "backupsrv.s3cret", "x")), "t.sql", ("R6",), hosts)
+    check(len(found) == 1 and "s3cret" not in found[0].message
+          and "host backupsrv " in found[0].message,
+          "an R6 message about a listed short name prints the listed name, not the longer text"
+          + PIN)
+    found = lint_text(q(unc(2, "Sup3rS3cret", "x")), "t.sql", ("R6",), hosts)
+    check(len(found) == 1 and "sup3rs3cret" not in found[0].message.lower()
+          and "host that is not on the --unc-host list" in found[0].message,
+          "an R6 message about an unlisted host does not print it, because it may be a secret"
+          + PIN)
 
     # ---- code the tool does not read
     def notes(sql, rules=DEFAULT_RULES):
@@ -1491,6 +1732,12 @@ def _run_checks(check, raises, tmp):
           and decode_sql(b"\xef\xbb\xbf" + text.encode("utf-8")) == text
           and decode_sql(text.encode("cp1252")) == text and decode_sql(b"SELECT 1") == "SELECT 1",
           "UTF-16 either way round, UTF-8 with a BOM, cp1252 and ASCII are all read")
+    pair_text = PAIR.replace("\n", "\r\n")
+    for label, raw in (("UTF-16 without a BOM", pair_text.encode("utf-16-le")),
+                       ("UTF-16 big endian without a BOM", pair_text.encode("utf-16-be")),
+                       ("UTF-32 with a BOM", pair_text.encode("utf-32")),
+                       ("UTF-32 without a BOM", pair_text.encode("utf-32-le"))):
+        raises(lambda r=raw: decode_sql(r), "%s is refused, not read as clean" % label)
 
     # ---- the command line, on real files
     good = put("good.sql", S("BEGIN TRANSACTION;", PAIR, "COMMIT;"))
@@ -1645,6 +1892,12 @@ def _run_checks(check, raises, tmp):
     check(code == 1 and ":1: R6 " in out and "rules R1 R2 R3 R5 R6" in out
           and "hunter2" not in everything and "secret" not in everything,
           "--unc-host turns R6 on, and nothing after the host name reaches the output or the CSV")
+    nobom = put("nobom.sql", "", PAIR.encode("utf-16-le"))
+    utf32 = put("utf32.sql", "", PAIR.encode("utf-32"))
+    for label, path in (("UTF-16 without a BOM", nobom), ("UTF-32", utf32)):
+        code, out, err = run_cli([path])
+        check(code == 2 and "NUL characters" in err and "finding(s)" not in out,
+              "%s file exits 2 and names the cause, and does not report it clean" % label + PIN)
     odd = put("odd.sql", "",
               ("DELETE FROM [t" + chr(233) + "st]\nINSERT INTO [t" + chr(233)
                + "st] SELECT 1").encode("utf-8"))
