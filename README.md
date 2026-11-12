@@ -495,8 +495,8 @@ to anything else. It prints the rule text with table names and, for R6, the name
   with no exception, in 1.2 seconds on Windows. The driver is not part of this repository, so you cannot repeat the run from here.
 - Run once by hand on Linux as an ordinary user: a subfolder with mode 000 gives `Permission denied` and exit 2
   instead of a clean pass; `ln victim.sql hl.sql` followed by `--out hl.sql --apply` overwrites `victim.sql`
-  with the CSV (listed under Limits); a folder reached only through a symbolic link gives exit 2, and a
-  symbolic link beside a real folder is not followed.
+  with the CSV (listed under Limits); a subfolder reached only through a symbolic link, in a folder that holds nothing else, gives exit 2, and a
+  symbolic link beside a real folder is not followed. A symbolic link given directly as the path argument is followed and linted.
 - The self-test writes only inside its own temporary folder and removes it. It leaves nothing in the
   working directory.
 - The file is pure ASCII and has no f-string. Python 3.9 runs it.
@@ -505,7 +505,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 | Code | Meaning |
 |---|---|
-| 0 | No finding, and no note. A procedure body is not read, except that a procedure run after an unprotected `DELETE` or `TRUNCATE`, or in a `CATCH` block before its `ROLLBACK`, gives a note. |
+| 0 | No finding, and no note, except that notes are off when only R6 runs (`--rules R6`), so exit 0 can hide an unread `EXEC` of a string. A procedure body is not read, except that a procedure run after an unprotected `DELETE` or `TRUNCATE`, or in a `CATCH` block before its `ROLLBACK`, gives a note. |
 | 1 | At least one finding, including E0. |
 | 2 | A file could not be read or decoded, a folder could not be listed or holds no `.sql` file, or `--out` could not be written. |
 | 3 | No finding, but a note says that some code was not read (`EXEC` of a string that may hold a write, `sp_executesql`, `:r`, `EXEC` of a procedure after an unprotected `DELETE` or `TRUNCATE`, or `EXEC` of a procedure in a `CATCH` block before its `ROLLBACK`). |
@@ -620,6 +620,11 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - A subfolder that is reached only through a symbolic link is not followed, and its `.sql` files are skipped without a message.
   The exit code does not warn about it, so a folder run can exit 0 without having read every script.
   A folder that holds only such a link exits 2 with `no .sql file found`.
+- The fuzz and mutation drivers are not shipped, so the 20,000-program run, the 425 and 437 mutation sweeps and the seven R1/R5 and six formula-guard mutations in Measured cannot be repeated from this repository.
+- The timings in this section depend on the machine and were taken with generator scripts that are not shipped. Treat them as orders of magnitude, not promises.
+- One audit run of a 300 KB file with 30,000 nested `BEGIN` blocks exited 1 after 48.9 seconds with empty output. Two reruns exited 0 and I did not reproduce the exit 1. An exit 1 with no output is not a verdict, so treat it as a failed run and run again.
+- Keywords are matched after Python upper-casing, so a Unicode letter such as the dotless i (U+0131) or the long s (U+017F) is read as ASCII `I` or `S`. A script that SQL Server would reject for such a word can still be read as a write verb.
+- A CSV from a run that exits 3 holds only the header row and carries no marker that code was not read. Read the exit code and the console output, not the file alone.
 - Naming the same file twice, or a file and its folder, reads it twice and doubles the findings and the file count.
 - One unreadable file (a permission error or truncated UTF-16) stops the run with exit 2. It prints none of the
   findings already collected from earlier files.
