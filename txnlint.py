@@ -321,6 +321,19 @@ def is_statement_start(toks, k):
     return True
 
 
+def merge_inserts(toks, k):
+    """True when the MERGE at k has a THEN INSERT clause, so it adds rows that do not match.
+
+    A MERGE ends at its semicolon. THEN INSERT can only be the WHEN NOT MATCHED action.
+    """
+    for j in range(k + 1, len(toks)):
+        if toks[j].batch != toks[k].batch or is_p(toks[j], ";"):
+            return False
+        if toks[j].u == "THEN" and at(toks, j + 1).u == "INSERT":
+            return True
+    return False
+
+
 def raise_is_guard(toks, k):
     """RAISERROR is a guard unless its severity is a literal below 11."""
     if not is_p(at(toks, k + 1), "("):
@@ -524,7 +537,8 @@ def plain_text(body):
     A variable, a function call or a number makes the string unreadable. The end-of-input
     token counts as an empty literal, so `sp_executesql` with no argument is not a note.
     """
-    if len(body) % 2 == 0 or not all(x.kind in ("s", "e") for x in body[0::2])             or not all(is_p(x, "+") for x in body[1::2]):
+    if len(body) % 2 == 0 or not all(x.kind in ("s", "e") for x in body[0::2]) \
+            or not all(is_p(x, "+") for x in body[1::2]):
         return None
     return "".join(x.val for x in body[0::2])
 
@@ -646,10 +660,14 @@ def scan(toks):
                 j += 2
             if not (t.u == "ALTER" and at(toks, k - 1).u == "OR") and at(toks, j).u in _MODULES:
                 add("module")
-        elif t.u in ("EXEC", "EXECUTE") and nxt.u not in ("", "AS", "SP_EXECUTESQL")                 and not is_p(nxt, "(") and at(toks, k - 1).u not in _NOT_AFTER:
+        elif t.u in ("EXEC", "EXECUTE") and nxt.u not in ("", "AS", "SP_EXECUTESQL") \
+                and not is_p(nxt, "(") and at(toks, k - 1).u not in _NOT_AFTER:
             add("exec", "", None, state_guards(toks, k, stack))
         elif t.u in _WRITES and is_statement_start(toks, k):
-            add("write", write_target(toks, k), t.u, state_guards(toks, k, stack))
+            target = write_target(toks, k)
+            add("write", target, t.u, state_guards(toks, k, stack))
+            if t.u == "MERGE" and merge_inserts(toks, k):
+                add("refill", target, t.u)
     # ROLLBACK TRAN name undoes only part of a transaction when name is a savepoint.
     saves = set()
     for i, e in enumerate(evs):
@@ -722,26 +740,51 @@ def walk(evs):
 
 
 def rule_r1(evs):
-    """A DELETE or TRUNCATE outside a transaction, then an INSERT into the same table."""
-    exposed, inserts, out, db = [], [], [], ""
+    """A DELETE or TRUNCATE that is committed, then an INSERT into the same table.
+
+    The delete either runs outside a transaction and commits by itself, or it runs in a
+    transaction that is committed before the INSERT. A MERGE with a THEN INSERT clause
+    counts as an INSERT. An INSERT in the same transaction as the delete is the safe refill.
+    """
+    exposed, inserts, held, out, db = [], [], [], [], ""
+    ended, was_in = None, False
     for pos, (e, in_tran) in enumerate(walk(evs)):
-        if e.kind == "use":
+        if was_in and not in_tran:
+            # The transaction ended since the last event. Its deletes are committed only
+            # when the last thing that ended it was a COMMIT.
+            if ended == "commit":
+                exposed += [(pos - 1, d, ddb, True) for d, ddb in held]
+            held = []
+        was_in = in_tran
+        if e.kind in ("commit", "rollback"):
+            ended = e.kind
+        elif e.kind == "use":
             db = e.name
-        if e.kind != "write" or not e.name:
+        if e.kind not in ("write", "refill") or not e.name:
             continue
-        if e.extra in ("DELETE", "TRUNCATE") and not in_tran and not is_scratch(e.name):
-            exposed.append((pos, e, db))
-        elif e.extra == "INSERT":
+        if e.kind == "write" and e.extra in ("DELETE", "TRUNCATE") and not is_scratch(e.name):
+            if in_tran:
+                held.append((e, db))
+                ended = None
+            else:
+                exposed.append((pos, e, db, False))
+        elif e.kind == "refill" or e.extra == "INSERT":
             inserts.append((pos, e, db))
-    for pos, d, ddb in exposed:
+            held = [(d, ddb) for d, ddb in held if not same_table(d.name, e.name, ddb, db)]
+    for pos, d, ddb, committed in exposed:
         for ipos, ins, idb in inserts:
             if ipos > pos and same_table(d.name, ins.name, ddb, idb):
                 where = "" if ins.batch == d.batch else " (batch %d)" % ins.batch
+                what = "INSERT" if ins.kind == "write" else "MERGE"
+                when = ("is committed in its own transaction before the %s at line %d%s "
+                        "starts. If that statement fails, the removed rows stay removed."
+                        if committed else
+                        "runs outside a transaction and commits by itself. The %s at line "
+                        "%d%s can fail or be killed, and the removed rows stay removed.")
                 out.append((d.line, d.batch,
-                            "%s %s runs outside a transaction and commits by itself. "
-                            "The INSERT at line %d%s can fail or be killed, and the removed "
-                            "rows stay removed. Put both statements in one BEGIN TRANSACTION "
-                            "and COMMIT." % (_VERB_FORM[d.extra], safe(d.name), ins.line, where)))
+                            ("%s %s " + when + " Put both statements in one BEGIN "
+                             "TRANSACTION and COMMIT.")
+                            % (_VERB_FORM[d.extra], safe(d.name), what, ins.line, where)))
                 break
     return out
 
@@ -825,20 +868,53 @@ def exec_in_catch(evs):
             for w, r in catch_pending(evs) if w.kind == "exec"]
 
 
+def swallowed_guards(evs):
+    """Indexes of the guards in a TRY block whose CATCH block does not raise again.
+
+    The error jumps to the CATCH. A CATCH with a THROW or RAISERROR of its own passes
+    the error on, and that guard is read in its own place. Otherwise the script goes on.
+    """
+    stack, closed, out = [], [], set()
+    for i, e in enumerate(evs):
+        if e.kind == "try":
+            stack.append([[], False])
+        elif e.kind == "endtry":
+            closed = stack.pop()[0] if stack else []
+        elif e.kind == "catch":
+            stack.append([closed, False])
+            closed = []
+        elif e.kind == "endcatch":
+            if stack:
+                guards, raises = stack.pop()
+                if not raises:
+                    out.update(guards)
+        elif e.kind == "guard" and stack:
+            if e.ctx == "try":
+                stack[-1][0].append(i)
+            else:
+                stack[-1][1] = True
+    return out
+
+
 def rule_r5(evs):
     """A THROW or RAISERROR guard, then a write that runs although the guard fired.
 
     THROW ends its own batch, so only a write in a later batch is reported. RAISERROR
     ends nothing, so a write after it in the same batch is reported too, unless a
     RETURN or GOTO follows the RAISERROR first (the guard event says so in extra).
+    A guard in a TRY block counts only when its CATCH block swallows the error, and then
+    only a write in a later batch is reported, whatever :on error says.
     A guard is reported once, at the first write it fails to stop.
     """
     pending, exit_on, shielded, out = [], False, set(), []
-    for e in evs:
+    swallowed = swallowed_guards(evs)
+    for i, e in enumerate(evs):
         if e.kind == "sqlcmd":
             exit_on = e.extra
         elif e.kind == "shield":
             (shielded.add if e.name == "on" else shielded.discard)(e.ref)
+        elif e.kind == "guard" and i in swallowed:
+            pending.append(e._replace(extra=False))
         elif e.kind == "guard" and e.ctx != "try" and not exit_on:
             pending.append(e)
         elif e.kind == "write" and not is_scratch(e.name):
@@ -853,6 +929,14 @@ def rule_r5(evs):
                            if g.name == "THROW" else
                            "move the check into the batch that writes and follow RAISERROR "
                            "with RETURN, or use THROW")
+                    if g.ctx == "try":
+                        out.append((g.line, g.batch,
+                                    "%s at line %d is caught by a CATCH block that does not "
+                                    "raise the error again, so the next GO sends batch %d "
+                                    "(line %d, %s) anyway. Put THROW in the CATCH block, "
+                                    "or move the check into the batch that writes."
+                                    % (g.name, g.line, e.batch, e.line, target)))
+                        continue
                     out.append((g.line, g.batch,
                                 "%s at line %d reports an error, but the next GO sends batch "
                                 "%d (line %d, %s) anyway. Run the script with sqlcmd -b "
@@ -908,7 +992,8 @@ def exec_after_delete(evs):
     """
     exposed, out = [], []
     for e, in_tran in walk(evs):
-        if e.kind == "write" and e.name and e.extra in ("DELETE", "TRUNCATE")                 and not in_tran and not is_scratch(e.name):
+        if e.kind == "write" and e.name and e.extra in ("DELETE", "TRUNCATE") \
+                and not in_tran and not is_scratch(e.name):
             exposed.append(e)
         elif e.kind == "exec" and exposed:
             d = exposed[0]
@@ -1294,6 +1379,50 @@ def _run_checks(check, raises, tmp):
           and lint(S("MERGE INTO t USING s ON 1 = 1 WHEN MATCHED THEN DELETE;",
                      "INSERT INTO t SELECT 1;")) == [],
           "an unreadable target and a MERGE are not reported as R1")
+    merge_in = "MERGE dbo.Lookup AS t USING dbo.Stage AS s ON t.Code = s.Code " \
+               "WHEN NOT MATCHED THEN INSERT (Code) VALUES (s.Code);"
+    found = lint_text(S("DELETE FROM dbo.Lookup;", merge_in, "GO"))
+    check([(f.rule, f.line) for f in found] == [("R1", 1)]
+          and "The MERGE at line 2" in found[0].message
+          and lint(S("DELETE FROM dbo.Lookup;", "GO", merge_in)) == [("R1", 1)]
+          and lint(S("BEGIN TRAN;", "DELETE FROM dbo.Lookup;", merge_in, "COMMIT;")) == [],
+          "a MERGE with WHEN NOT MATCHED THEN INSERT refills the table like an INSERT" + PIN)
+    check(lint(S("DELETE FROM dbo.Lookup;",
+                 "MERGE dbo.Lookup AS t USING dbo.Stage AS s ON t.Code = s.Code "
+                 "WHEN MATCHED THEN UPDATE SET Code = s.Code;")) == []
+          and lint(S("DELETE FROM dbo.Lookup;", "MERGE dbo.Lookup AS t USING dbo.Stage AS s "
+                     "ON 1 = 1 WHEN MATCHED THEN UPDATE SET Code = 1", "GO", "SELECT 1;")) == []
+          and lint(S("DELETE FROM dbo.Lookup;", "MERGE dbo.Lookup AS t USING dbo.Stage AS s "
+                     "ON 1 = 1 WHEN MATCHED THEN UPDATE SET Code = 1")) == [],
+          "a MERGE with no INSERT clause is no refill, with or without a closing semicolon")
+    split = S("BEGIN TRAN;", "DELETE FROM dbo.Lookup;", "COMMIT;", "GO",
+              "INSERT INTO dbo.Lookup (Code) VALUES (1);", "GO")
+    found = lint_text(split)
+    check([(f.rule, f.line) for f in found] == [("R1", 2)]
+          and "committed in its own transaction before the INSERT at line 5 (batch 2)"
+          in found[0].message
+          and lint(S("BEGIN TRAN;", "TRUNCATE TABLE dbo.Lookup;", "COMMIT;", "BEGIN TRAN;",
+                     "INSERT INTO dbo.Lookup (Code) VALUES (1);", "COMMIT;")) == [("R1", 2)]
+          and lint(S("BEGIN TRAN;", "DELETE FROM dbo.Lookup;", "COMMIT;", merge_in))
+          == [("R1", 2)],
+          "a DELETE committed in its own transaction, then an INSERT in a later one, is R1"
+          + PIN)
+    check(lint(S("BEGIN TRAN;", "DELETE FROM dbo.Lookup;", "ROLLBACK;", "GO",
+                 "INSERT INTO dbo.Lookup (Code) VALUES (1);")) == []
+          and lint(S("BEGIN TRAN;", "DELETE FROM dbo.Lookup;", "INSERT INTO dbo.Lookup SELECT 1;",
+                     "COMMIT;", "BEGIN TRAN;", "DELETE FROM dbo.Lookup;",
+                     "INSERT INTO dbo.Lookup SELECT 2;", "COMMIT;")) == []
+          and lint(S("BEGIN TRAN;", "DELETE FROM #w;", "COMMIT;",
+                     "INSERT INTO #w SELECT 1;")) == []
+          and lint(S("BEGIN TRAN;", "BEGIN TRAN;", "DELETE FROM dbo.Lookup;", "COMMIT;",
+                     "INSERT INTO dbo.Lookup SELECT 1;", "COMMIT;")) == []
+          and lint(S("BEGIN TRAN;", "DELETE FROM dbo.Lookup;", "COMMIT;", "GO",
+                     "INSERT INTO dbo.Other SELECT 1;")) == []
+          and lint(S("SET IMPLICIT_TRANSACTIONS ON;", "DELETE FROM dbo.Lookup;",
+                     "SET IMPLICIT_TRANSACTIONS OFF;", "INSERT INTO dbo.Lookup SELECT 1;"))
+          == [],
+          "a rolled back delete, a refill in the same transaction, scratch tables, nested "
+          "transactions and another table are not R1")
     check(lint(S("DELETE b FROM dbo.Helper b JOIN #w w ON w.id = b.id;",
                  "INSERT INTO dbo.Helper (id) SELECT id FROM #w;")) == [("R1", 1)],
           "R1 sees a DELETE written through an alias" + PIN)
@@ -1550,11 +1679,27 @@ def _run_checks(check, raises, tmp):
           and lint(S(":on error exit -- stop at the first error", guard, "GO",
                      "DELETE FROM dbo.Target;")) == [],
           ":on error exit silences R5 until :on error ignore turns it back on")
-    check(lint(S("BEGIN TRY", "THROW 50001, 'x', 1;", "END TRY", "BEGIN CATCH", "SELECT 1;",
-                 "END CATCH", "GO", "DELETE FROM dbo.T;")) == []
-          and lint(S("BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH", "THROW;", "END CATCH",
-                     "GO", "DELETE FROM dbo.T;")) == [("R5", 5)],
-          "a THROW in TRY jumps to CATCH and is no guard, a re-THROW in CATCH is one")
+    check(lint(S("BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH", "THROW;", "END CATCH",
+                 "GO", "DELETE FROM dbo.T;")) == [("R5", 5)]
+          and lint(S("BEGIN TRY", "THROW 50001, 'x', 1;", "END TRY", "BEGIN CATCH", "THROW;",
+                     "END CATCH", "GO", "DELETE FROM dbo.T;")) == [("R5", 5)],
+          "a re-THROW in CATCH is the guard, and the THROW in TRY that it passes on is not")
+    swallow = S("BEGIN TRY", "  IF @n = 0 THROW 50000, 'bad', 1;", "END TRY", "BEGIN CATCH",
+                "  PRINT ERROR_MESSAGE();", "END CATCH;", "GO", "DELETE FROM dbo.Lookup;", "GO")
+    check(lint(swallow) == [("R5", 2)]
+          and lint(S(":on error exit", swallow)) == [("R5", 3)]
+          and lint(S("BEGIN TRY", "RAISERROR('bad', 16, 1);", "END TRY", "BEGIN CATCH",
+                     "PRINT 1;", "END CATCH", "GO", "INSERT INTO dbo.T SELECT 1;")) == [("R5", 2)]
+          and "CATCH block that does not raise" in lint_text(swallow, "t.sql")[0].message,
+          "a THROW in TRY is a guard when its CATCH only prints, and the next batch writes"
+          + PIN)
+    check(lint(S("BEGIN TRY", "THROW 50000, 'bad', 1;", "DELETE FROM dbo.T;", "END TRY",
+                 "BEGIN CATCH", "PRINT 1;", "END CATCH")) == []
+          and lint(S("END TRY", "BEGIN CATCH", "END CATCH", "END CATCH", "GO",
+                     "DELETE FROM dbo.T;")) == []
+          and lint(S("BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH", "PRINT 1;", "END CATCH",
+                     "GO", "DELETE FROM dbo.T;")) == [],
+          "a swallowed guard needs a later batch, and a stray END TRY or END CATCH is no guard")
 
     def raised(args):
         return lint(S("IF 1 = 0 RAISERROR(" + args + ")", "GO", "DELETE FROM dbo.T;"))
@@ -1585,13 +1730,18 @@ def _run_checks(check, raises, tmp):
           "and a superscript digit is not a number" + PIN)
     check(lint(S("BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH", "BEGIN TRY",
                  "THROW 50001, 'x', 1;", "END TRY", "BEGIN CATCH", "SELECT 1;", "END CATCH",
-                 "END CATCH", "GO", "DELETE FROM dbo.T;")) == []
+                 "END CATCH", "GO", "DELETE FROM dbo.T;")) == [("R5", 6)]
           and lint(S("BEGIN TRY", "BEGIN TRY", "SELECT 1;", "END TRY", "BEGIN CATCH",
                      "SELECT 2;", "END CATCH", "THROW 50001, 'x', 1;", "END TRY", "BEGIN CATCH",
-                     "SELECT 3;", "END CATCH", "GO", "DELETE FROM dbo.T;")) == [],
-          "the innermost TRY decides whether a guard counts, and END CATCH closes only its own")
+                     "SELECT 3;", "END CATCH", "GO", "DELETE FROM dbo.T;")) == [("R5", 8)]
+          and lint(S("BEGIN TRY", "BEGIN TRY", "THROW 50001, 'x', 1;", "END TRY", "BEGIN CATCH",
+                     "SELECT 2;", "END CATCH", "END TRY", "BEGIN CATCH", "THROW;", "END CATCH",
+                     "GO", "DELETE FROM dbo.T;")) == [("R5", 3), ("R5", 10)],
+          "the innermost TRY decides which CATCH swallows a guard, and END CATCH closes only "
+          "its own")
     check(lint(S("BEGIN TRY", "IF 1 = 1", "BEGIN", "THROW 50001, 'x', 1;", "END", "END TRY",
-                 "BEGIN CATCH", "SELECT 1;", "END CATCH", "GO", "DELETE FROM dbo.T;")) == []
+                 "BEGIN CATCH", "SELECT 1;", "END CATCH", "GO", "DELETE FROM dbo.T;"))
+          == [("R5", 4)]
           and lint(S("BEGIN TRY", "BEGIN", "SELECT 1;", "END", "END TRY", "BEGIN CATCH",
                      "SELECT 1;", "END CATCH", "IF 1 = 1 THROW 50001, 'x', 1;", "GO",
                      "DELETE FROM dbo.T;")) == [("R5", 9)],

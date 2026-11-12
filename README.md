@@ -30,15 +30,16 @@ PASS  a write straight after SET ... ON, with no semicolon, is still a statement
 ...
 PASS  a bare DELETE then an INSERT into the same table is R1
 ...
-PASS  a BEGIN TRANSACTION that an IF or WHILE governs does not make the DELETE safe  <-- pinned defect
-...
 PASS  a ROLLBACK in an early-exit branch does not end the transaction for the code after it  <-- pinned defect
+...
+PASS  a BEGIN TRANSACTION that an IF or WHILE governs does not make the DELETE safe  <-- pinned defect
 ...
 PASS  SET XACT_ABORT ON with two bare writes is R2
 ...
 PASS  a log INSERT in CATCH before the ROLLBACK is R3
 ...
 PASS  a CATCH that tests XACT_STATE before it writes is not R3, and one that does not is  <-- pinned defect
+...
 PASS  an XACT_STATE test that only prints does not spare the write after it  <-- pinned defect
 ...
 PASS  a THROW guard in one batch and a DELETE in the next is R5
@@ -51,8 +52,6 @@ PASS  a listed host needs exactly two backslashes, in any case
 ...
 PASS  an R6 message about an unlisted host does not print it, because it may be a secret  <-- pinned defect
 ...
-PASS  UTF-16 without a BOM file exits 2 and names the cause, and does not report it clean  <-- pinned defect
-...
 PASS  a bracket-quoted sp_executesql with a write or a variable is a note, not a clean run  <-- pinned defect
 ...
 PASS  a string joined from literals is read as one, so a split verb is a note  <-- pinned defect
@@ -64,15 +63,17 @@ PASS  a path and a message that start with equals each get one leading apostroph
 ...
 PASS  a unique prefix --ap of a long flag is refused with 64  <-- pinned defect
 ...
+PASS  UTF-16 without a BOM file exits 2 and names the cause, and does not report it clean  <-- pinned defect
+...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-213 assertions, 0 failed
+219 assertions, 0 failed
 ```
 
-The full run prints all 213 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 219 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -257,11 +258,16 @@ so a typo cannot overwrite a script. A hard link to an input is not detected (se
 Each rule reports at the line of the statement that causes the problem. R4 is not used. The ids of
 the first four rules stay as they are, so a later rule can take R4 without renumbering.
 
-**R1. A `DELETE` or `TRUNCATE` outside a transaction, then an `INSERT` into the same table.**
+**R1. A `DELETE` or `TRUNCATE` that commits, then an `INSERT` into the same table.**
 Each statement outside a transaction is committed or rolled back when it completes, so the `DELETE`
 is permanent before the `INSERT` starts. A run-time error rolls back only the statement that failed.
 A `TRUNCATE TABLE` can be rolled back, but only inside a transaction. Fix: put both statements
-between `BEGIN TRANSACTION` and `COMMIT`. The tool matches table names by their tail, ignoring case and
+between `BEGIN TRANSACTION` and `COMMIT`. A `DELETE` inside a transaction is reported too when that
+transaction is committed before the `INSERT` runs, in a later batch or in a second transaction: the rows are
+gone by then, and a failed `INSERT` leaves the table empty. An `INSERT` in the same transaction as the `DELETE`
+is the safe refill and is not reported, and neither is a `DELETE` that the transaction rolls back. A `MERGE`
+with a `WHEN NOT MATCHED THEN INSERT` clause counts as an `INSERT`; a `MERGE` with no `INSERT` clause does not.
+The tool matches table names by their tail, ignoring case and
 brackets. It ignores temp tables and table variables. It follows an alias, so `DELETE b FROM dbo.Helper b JOIN ...`
 is a `DELETE` of `dbo.Helper`. It reads a table name that starts with a sqlcmd variable, such as `$(Schema).Lookup`, so a `DELETE` and an
 `INSERT` that name it are paired. A `ROLLBACK` that sits under `IF`, `ELSE` or `WHILE`, or in a `BEGIN`/`END` block that one of
@@ -304,7 +310,12 @@ A write after it in the same batch is reported, unless a `RETURN` or `GOTO` foll
 block before any write. A `RETURN` that is itself the body of an `IF` does not count. For a `RAISERROR` the fix
 is to follow it with `RETURN`, or to use `THROW`; moving the check next to the write does not help.
 `:on error exit` turns R5 off until an `:on error ignore`. A `RAISERROR` with a literal severity below 11 is not
-a guard. A guard in a `TRY` block is not a guard, because it jumps to `CATCH`. R5 also reads procedure bodies,
+a guard. A guard in a `TRY` block jumps to the `CATCH` block. If that `CATCH` holds a `THROW` or a
+`RAISERROR` of its own, the error goes on and that statement is the guard. If the `CATCH` only prints or logs,
+it swallows the error and the script goes on. The guard in the `TRY` is then reported at the first write in a later
+batch, and `sqlcmd -b` and `:on error exit` do not change that, because the error never reaches `sqlcmd`. The fix is
+a `THROW` in the `CATCH` block, or the check in the batch that writes. A write in the same batch, after the guard in
+the `TRY`, is never reported, because the jump to `CATCH` skips it. R5 also reads procedure bodies,
 where only the same-batch `RAISERROR` case can occur.
 
 A write in the `ELSE` branch of the `IF` that holds the `RAISERROR` is not reported for that guard, because the
@@ -421,11 +432,12 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A sqlcmd `$(variable)` is part of a name | "a sqlcmd $(variable) is part of a name", "a table named through a sqlcmd variable" |
 | A `BEGIN TRANSACTION` under an `IF` or `WHILE` does not count, unless the condition reads `@@TRANCOUNT` or `XACT_STATE()` | "a BEGIN TRANSACTION that an IF or WHILE governs", "IF @@TRANCOUNT = 0 BEGIN TRANSACTION, the XACT_STATE() form and a plain block", "an ELSE with no IF before it" |
 | R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs" |
+| R1 reports a `MERGE` with a `THEN INSERT` as a refill, and a `DELETE` that commits in its own transaction before the `INSERT`, and spares the safe shapes | "a MERGE with WHEN NOT MATCHED THEN INSERT refills the table like an INSERT", "a MERGE with no INSERT clause is no refill", "a DELETE committed in its own transaction, then an INSERT in a later one", "a rolled back delete, a refill in the same transaction, scratch tables, nested transactions and another table are not R1" |
 | A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
 | R2 sees `XACT_ABORT` across `GO` and ignores scratch tables | "SET XACT_ABORT ON with two bare writes", "XACT_ABORT set in one batch", "inside a procedure only its own SET counts", "scratch writes do not count", "R2 points at the SET", "R2 lists five lines" |
 | R3 reports a write before the `ROLLBACK`, and spares the safe shapes | "a log INSERT in CATCH", "the same CATCH with the ROLLBACK first", "a table variable survives ROLLBACK", "a CATCH that tests XACT_STATE", "an XACT_STATE test that only prints", "a write that an IF or ELSE on XACT_STATE governs", "a write before the XACT_STATE test", "a CATCH that commits and never rolls back", "a stray END TRY opens no transaction" |
-| R5 reports a THROW guard and a later write, and honours `:on error` and `TRY` | "a THROW guard in one batch", ":on error exit silences R5", "a THROW in TRY jumps to CATCH", "each guard is reported once", "a later batch with a guard of its own", "the innermost TRY decides", "a guard in a block inside TRY" |
+| R5 reports a THROW guard and a later write, and honours `:on error` and `TRY` | "a THROW guard in one batch", ":on error exit silences R5", "a re-THROW in CATCH is the guard", "a THROW in TRY is a guard when its CATCH only prints", "a swallowed guard needs a later batch", "each guard is reported once", "a later batch with a guard of its own", "the innermost TRY decides which CATCH swallows a guard", "a guard in a block inside TRY" |
 | A write in the `ELSE` of the `IF` that holds a `RAISERROR` is not reported for it, and a write after the `IF` still is | "a write in the ELSE of an IF whose branch is a RAISERROR", "the same holds when the RAISERROR is in a BEGIN block", "an ELSE IF chain, a WHILE, a nested IF", "a write after the whole IF and ELSE", "the skipped branch ends at a GO", "a skipped branch is marked on and off" |
 | R5 reads `RAISERROR` as a message that ends nothing, unless a `RETURN` follows | "RAISERROR is a guard at severity 11", "a RAISERROR guard and a write in the same batch", "a RETURN or GOTO in the same block", "a RETURN that is conditional", ":on error exit, a THROW, a RAISERROR in TRY", "a RAISERROR severity is read after an IF condition", "the advice differs", "a comma inside a nested call" |
 | R6 counts backslashes for a listed host and never prints the path or an unlisted host name | "a listed host needs exactly two backslashes", "a listed short host also covers its fully qualified name", "a two-backslash path to an unlisted host", "an R6 message about a listed host names the host and never prints the path", "an R6 message about an unlisted host does not print it", "an R6 message about a listed short name prints the listed name", "a path inside dynamic SQL", "a bracketed name or a bare word" |
@@ -449,15 +461,19 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1114 statements and 452 branches, measured with
+- Branch coverage is 100 percent: 1175 statements and 490 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 213 assertions with 0 failed on every interpreter I ran in this round: Python 3.12.10
-  and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
+- The self-test prints 219 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+  3.12.10 and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain.
 - Coverage was measured on Windows only. The Linux host has no `coverage` package.
-- I broke the new guard six ways in a scratch copy: no apostrophe at all, no guard on `message`, no guard on
+- I broke the R1 and R5 fixes seven ways in a scratch copy: a `MERGE` that never counts as an insert, no promotion of a
+  committed delete, no dropping of a delete refilled in its own transaction, a `ROLLBACK` read as a `COMMIT`, an empty
+  swallowed-guard set, a `CATCH` re-raise that is ignored, and `:on error exit` silencing a swallowed guard. The self-test
+  went red every time.
+- I broke the formula guard six ways in a scratch copy: no apostrophe at all, no guard on `message`, no guard on
   `path`, no `isinstance` test, no tab in the list, and a `csv.reader` call added to production code. The
   self-test went red every time.
 - An earlier one-off sweep of 425 single-token mutations (swap `and` and `or`, flip a comparison, turn `break` or
@@ -526,16 +542,14 @@ to anything else. It prints the rule text with table names and, for R6, the name
   read, the tool cannot tell. It then reports `DELETE FROM dbo.Lookup` with `INSERT INTO OtherDb.dbo.Lookup`, so that
   a refill is never missed. A `USE` in a file that you run after another one is not carried over.
 - A `THROW` in a `CATCH` block that sits inside an outer `TRY` is still counted as an R5 guard, although it jumps to the outer `CATCH`.
-- R1 does not treat a `MERGE` as a refill of a deleted table. A `DELETE` through a CTE name
-  (`WITH c AS (...) DELETE FROM c`) is read as a delete of `c`, so it does not pair with an `INSERT` into the base table.
+- A `DELETE` through a CTE name (`WITH c AS (...) DELETE FROM c`) is read as a delete of `c`, so it does not pair
+  with an `INSERT` into the base table.
 - R5 counts only `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `TRUNCATE` as writes. A later batch that only runs `EXEC` of a
   procedure, DDL (`ALTER`, `DROP`, `CREATE`) or `SELECT ... INTO` is not reported.
 - Only a procedure named `sp_executesql` is read as dynamic SQL, bracket-quoted or not (`EXEC [dbo].[sp_executesql] N'...'`
   gives the same note). Other procedures that run a string inside their own body (`sp_MSforeachtable 'DELETE FROM ?'`,
   `xp_cmdshell 'sqlcmd -Q ...'`, `EXEC dbo.usp_x @sql = 'DELETE ...'`) give no note, and an `EXEC` whose target is a
   variable (`EXEC @procname`) gives none either, because the tool cannot see which procedure runs.
-- R1 does not count a `MERGE ... WHEN NOT MATCHED THEN INSERT` as a refill, so `DELETE FROM t` followed by a `MERGE`
-  into `t` exits 0.
 - Run time grows sharply on pathological input. A chain of 3,000 `IF @x = n RAISERROR(...) ELSE` links took 46 seconds
   in an audit run, and 30,000 nested `BEGIN` blocks took 62 seconds. Whole files are read into memory, about 1.2 seconds
   per megabyte.
@@ -573,8 +587,17 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - The only procedure calls that give a note are those after an unprotected `DELETE` or `TRUNCATE`, and those in a
   `CATCH` block before its `ROLLBACK`. A procedure that deletes and refills inside its own body is another script.
   Lint that script on its own. A procedure that writes after an unwrapped `UPDATE` is not seen.
-- R1 reports only a `DELETE` that runs outside a transaction. A `DELETE` that is committed in one transaction before
-  the `INSERT` opens a second one is not reported, although the rows are already gone when the `INSERT` starts.
+- R1 pairs every committed `DELETE` with every later `INSERT` into the same table, whatever the `WHERE` clause says.
+  A purge of old rows followed by an unrelated `INSERT` into the same table is reported.
+- R1 reads a `COMMIT` as committing the `DELETE` even when the `COMMIT` is conditional, such as `IF @@TRANCOUNT > 0 COMMIT`.
+- R5 reads any `THROW` or `RAISERROR` in a `CATCH` block as a re-raise, even one under an `IF`. A `CATCH` that raises
+  again only on some paths hides the guard in its `TRY` from R5.
+- A table name taken from a quoted identifier is printed as written, so do not put secrets in object names.
+  Table names are printed in lower case: `DELETE FROM dbo.A` prints as `dbo.a`.
+- A `\xNN` byte that cp1252 does not define is decoded as U+FFFD, and the file is still read. This affects only odd encodings.
+- If the console or a pipe fails while the report prints, the exit code can be 1 or 120 and does not mean findings.
+  Standard output on `/dev/full` gave 120 on Linux.
+- A header-only CSV does not mean clean. Check the exit code.
 - A write verb hidden by a variable, `CHAR()` or `EXEC` of a string built at run time is a note, never a finding,
   because the tool does not run the code.
 - A double-quoted string, which is a string only when `QUOTED_IDENTIFIER` is off, is read as a name.
