@@ -380,6 +380,8 @@ def is_purge(toks, k):
     LogDate < DATEADD(DAY, -90, GETDATE()), or `>` with it on the left, as in
     DATEDIFF(DAY, LogDate, GETDATE()) > 90. LoadDate > DATEADD(DAY, -1, GETDATE())
     deletes the recent rows, so a refill after it is still R1.
+    Any OR in the WHERE clause rules a purge out: LogDate < DATEADD(...) OR @Force = 1
+    can match every row, so a refill after it is still R1.
     shortcut: a cut-off held in a variable or a column is not seen. Name the date
     function in the WHERE clause to mark a purge.
     """
@@ -389,7 +391,9 @@ def is_purge(toks, k):
         j += 1
     conds, cur = [], []
     for t in toks[j:end]:
-        if t.u in ("AND", "OR"):
+        if t.u == "OR":
+            return False
+        if t.u == "AND":
             conds.append(cur)
             cur = []
         else:
@@ -1456,6 +1460,15 @@ def _run_checks(check, raises, tmp):
                      refill)) == []
           and lint(S("DELETE FROM dbo.Lookup WHERE LoadDate < @cutoff;", refill)) == [("R1", 1)],
           "the date function on the old side of < or >, joined by AND, still marks a purge")
+    check(lint(S("DELETE FROM dbo.Lookup WHERE LoadDate < DATEADD(DAY, -90, GETDATE()) "
+                 "OR @ForceRefresh = 1;", refill)) == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.Lookup WHERE LoadDate < DATEADD(DAY, -90, GETDATE()) "
+                     "OR 1 = 1;", refill)) == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.Lookup WHERE (LoadDate < DATEADD(DAY, -90, GETDATE()) "
+                     "OR Label LIKE '%') AND Region = 1;", refill)) == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.Lookup WHERE Id = 1 OR Id = 2;", refill)) == [("R1", 1)],
+          "an OR in the WHERE clause can match every row, so it is not a purge and a later INSERT is R1"
+          + PIN)
     check(lint(S("TRUNCATE TABLE dbo.Lookup;", "INSERT INTO dbo.Lookup SELECT 1;"))
           == [("R1", 1)],
           "a bare TRUNCATE then an INSERT is R1")

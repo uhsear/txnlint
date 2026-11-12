@@ -74,10 +74,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-226 assertions, 0 failed
+227 assertions, 0 failed
 ```
 
-The full run prints all 226 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 227 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -440,7 +440,7 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A write straight after `SET ... ON` is a statement even with no semicolon | "a write straight after SET ... ON", "a bare pair straight after SET ... ON", "R2 counts writes that follow SET XACT_ABORT ON" |
 | A sqlcmd `$(variable)` is part of a name | "a sqlcmd $(variable) is part of a name", "a table named through a sqlcmd variable" |
 | A `BEGIN TRANSACTION` under an `IF` or `WHILE` does not count, unless the condition reads `@@TRANCOUNT` or `XACT_STATE()` | "a BEGIN TRANSACTION that an IF or WHILE governs", "IF @@TRANCOUNT = 0 BEGIN TRANSACTION, the XACT_STATE() form and a plain block", "an ELSE with no IF before it" |
-| R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs", "a purge of old rows by date is not a refill", "a delete of the recent window is a refill", "the date function on the old side of < or >", "an equality on today, a key test, a delete of every row and a truncate are still R1" |
+| R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs", "a purge of old rows by date is not a refill", "an OR in the WHERE clause can match every row, so it is not a purge", "a delete of the recent window is a refill", "the date function on the old side of < or >", "an equality on today, a key test, a delete of every row and a truncate are still R1" |
 | R1 reports a `MERGE` with a `THEN INSERT` as a refill, and a `DELETE` that commits in its own transaction before the `INSERT`, and spares the safe shapes | "a MERGE with WHEN NOT MATCHED THEN INSERT refills the table like an INSERT", "a MERGE with no INSERT clause is no refill", "a DELETE committed in its own transaction, then an INSERT in a later one", "a rolled back delete, a refill in the same transaction, scratch tables, nested transactions and another table are not R1" |
 | A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
@@ -470,10 +470,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1245 statements and 528 branches, measured with
+- Branch coverage is 100 percent: 1248 statements and 530 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 226 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 227 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.12.10 and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain.
@@ -603,7 +603,8 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - R1 knows a purge only by its `WHERE` clause: a date function (`GETDATE`, `GETUTCDATE`, `SYSDATETIME`,
   `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD` or `DATEDIFF`) on the old side of a `<` or `>`,
   that is on the right of `<` or on the left of `>`. A cut-off held in a variable (`WHERE LogDate < @cutoff`) is not seen
-  and is still paired. Each `AND` or `OR` condition is judged by its first `<` or `>`, and `<>` is never a purge.
+  and is still paired. Each `AND` condition is judged by its first `<` or `>`, and `<>` is never a purge. Any `OR` in the `WHERE` clause rules a purge out,
+  because `LogDate < DATEADD(DAY, -90, GETDATE()) OR @Force = 1` can match every row, so a later `INSERT` is still paired.
 - R1 reads a `COMMIT` as committing the `DELETE` even when the `COMMIT` is conditional, such as `IF @@TRANCOUNT > 0 COMMIT`.
 - R5 reads any `THROW` or `RAISERROR` in a `CATCH` block as a re-raise, even one under an `IF`. A `CATCH` that raises
   again only on some paths hides the guard in its `TRY` from R5.
@@ -611,7 +612,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
   Table names are printed in lower case: `DELETE FROM dbo.A` prints as `dbo.a`.
 - A `\xNN` byte that cp1252 does not define is decoded as U+FFFD, and the file is still read. This affects only odd encodings.
 - If the console or a pipe fails while the report prints, the exit code can be 1 or 120 and does not mean findings.
-  Standard output on `/dev/full` gave 120 on Linux.
+  Standard output on `/dev/full` gave 120 on Linux. See the closed-pipe entry below.
 - A header-only CSV does not mean clean. Check the exit code.
 - A write verb hidden by a variable, `CHAR()` or `EXEC` of a string built at run time is a note, never a finding,
   because the tool does not run the code.
@@ -657,11 +658,14 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - The guard on `message` is exercised only through `write_findings` with a synthetic finding. No real message can start
   with `=`, `+`, `-`, `@`, tab or carriage return, so no command-line case reaches that guard end to end.
 - A hostile file name from the command line is tested for `=`, `+`, `-` and `@` only. Tab and carriage return are
-  tested through `write_findings`, because Windows cannot create such file names.
+  tested through `write_findings`, because the tests do not create file names that start with them on Windows.
+  Microsoft lists the control characters 1 through 31 as reserved in a file name outside alternate data streams
+  (https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file, "Naming Files, Paths, and Namespaces").
 - The `isinstance` test inside the cell guard has no assertion of its own. Removing it turns the self-test red by a
   `TypeError` in the assertion list, not by a named assertion. `cell()` is called only with path and message strings.
-- A closed output pipe, or an `--out` path that holds a NUL character, ends in a Python traceback with exit 1, the same
-  code as "findings exist". Read the output, not only the exit code.
+- A closed output pipe ends in a Python traceback with exit 1 or, on Windows, an "Exception ignored on flushing
+  sys.stdout" message with exit 120 (`python txnlint.py x.sql | head -c 0`). An `--out` path that holds a NUL character
+  ends in a traceback with exit 1. Exit 1 is also the code for "findings exist". Read the output, not only the exit code.
 - E0 exits 1, the same code as an ordinary finding. A caller must read the output to tell an unreadable file from a rule that fired.
 - An unexpected internal error exits 1 with a Python traceback, the same code as "findings exist". `main()` has no catch-all that maps a crash to its own code.
   A 20,000-program random token run in this round raised no exception. The driver is not in this repository, so you cannot repeat it from here.
