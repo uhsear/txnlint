@@ -261,6 +261,49 @@ def read_name(toks, j):
     return ".".join(parts), j
 
 
+def paren_open(toks, j):
+    """toks[j] is ")". Return the index of its matching "(", or -1."""
+    depth = 0
+    while j >= 0:
+        if is_p(toks[j], ")"):
+            depth += 1
+        elif is_p(toks[j], "(") and depth == 1:
+            return j
+        elif is_p(toks[j], "("):
+            depth -= 1
+        j -= 1
+    return -1
+
+
+def cte_base(toks, k, name):
+    """The table behind `name` when the write at k directly follows WITH name AS (SELECT ...).
+
+    A DELETE or UPDATE through a common table expression changes the table in its first
+    FROM, not a table called `name`. Returns `name` when it is no CTE of this statement or
+    its FROM is a derived table.
+    shortcut: a CTE that joins reads as its first table, and one defined with a column
+    list (WITH d (a, b) AS) is not seen. Name the base table in the DELETE to be exact.
+    """
+    ctes, j = {}, k - 1
+    while is_p(at(toks, j), ")"):
+        o = paren_open(toks, j)
+        if at(toks, o - 1).u != "AS":
+            break
+        ctes[at(toks, o - 2).val.lower()] = (o, j)
+        if not is_p(at(toks, o - 3), ","):
+            break
+        j = o - 4
+    seen = 0
+    while name in ctes and seen < len(ctes):
+        o, c = ctes[name]
+        f = next((i for i in range(o, c) if toks[i].u == "FROM"), c)
+        base = read_name(toks, f + 1)[0] if f < c else ""
+        if not base:
+            break
+        name, seen = base, seen + 1
+    return name
+
+
 def write_target(toks, k):
     """The table a write verb at k names, or "" when the name cannot be read."""
     j = k + 1
@@ -274,6 +317,10 @@ def write_target(toks, k):
         j += 1
     name, j = read_name(toks, j)
     follow = at(toks, j).u
+    if name and "." not in name and not is_scratch(name) and toks[k].u in ("DELETE", "UPDATE"):
+        base = cte_base(toks, k, name)
+        if base != name:
+            return base
     if name and "." not in name and not is_scratch(name) and (
             (toks[k].u == "DELETE" and follow == "FROM")
             or (toks[k].u == "UPDATE" and follow == "SET")):
@@ -326,20 +373,36 @@ _NOW_WORDS = frozenset(["GETDATE", "GETUTCDATE", "SYSDATETIME", "SYSUTCDATETIME"
 
 
 def is_purge(toks, k):
-    """True when the DELETE at k removes rows by age: a WHERE with a date function and < or >.
+    """True when the DELETE at k removes old rows: its WHERE tests a date function against a cut-off.
 
     A purge of old rows is not a refill, so R1 does not pair it with a later INSERT.
-    shortcut: a cut-off held in a variable or a column is not seen, and a window such as
-    LoadDate >= DATEADD(DAY, -1, GETDATE()) reads as a purge. Name the date function in
-    the WHERE clause to mark a purge, or lint the refill form without it.
+    The test must point at the past: `<` with the date function on the right, as in
+    LogDate < DATEADD(DAY, -90, GETDATE()), or `>` with it on the left, as in
+    DATEDIFF(DAY, LogDate, GETDATE()) > 90. LoadDate > DATEADD(DAY, -1, GETDATE())
+    deletes the recent rows, so a refill after it is still R1.
+    shortcut: a cut-off held in a variable or a column is not seen. Name the date
+    function in the WHERE clause to mark a purge.
     """
     j = k + 1
     end = simple_end(toks, k)
     while j < end and toks[j].u != "WHERE":
         j += 1
-    rest = toks[j:end]
-    return any(t.u in _NOW_WORDS for t in rest) and any(
-        t.kind == "p" and t.val in "<>" for t in rest)
+    conds, cur = [], []
+    for t in toks[j:end]:
+        if t.u in ("AND", "OR"):
+            conds.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    conds.append(cur)
+    for c in conds:
+        i = next((i for i, t in enumerate(c) if t.kind == "p" and t.val in "<>"), -1)
+        if i < 0 or (c[i].val == "<" and is_p(at(c, i + 1), ">")):
+            continue
+        side = c[i + 1:] if c[i].val == "<" else c[:i]
+        if any(t.u in _NOW_WORDS for t in side):
+            return True
+    return False
 
 
 def merge_inserts(toks, k):
@@ -1332,6 +1395,28 @@ def _run_checks(check, raises, tmp):
           and len(writes("SELECT 1 DELETE FROM t INSERT INTO t SELECT 1")) == 2
           and writes("DELETE FROM t OUTPUT DELETED.a INTO @log") == [("DELETE", "t")],
           "a write after IF or after a statement with no semicolon is still found")
+    check(writes("WITH d AS (SELECT code FROM dbo.Lookup) DELETE FROM d")
+          == [("DELETE", "dbo.lookup")]
+          and writes("WITH d AS (SELECT TOP (5) code FROM dbo.Lookup l WHERE 1 = 1) DELETE d")
+          == [("DELETE", "dbo.lookup")]
+          and writes("WITH u AS (SELECT * FROM dbo.Lookup) UPDATE u SET a = 1")
+          == [("UPDATE", "dbo.lookup")]
+          and writes("WITH a AS (SELECT x FROM dbo.Lookup), d AS (SELECT x FROM a) DELETE FROM d")
+          == [("DELETE", "dbo.lookup")],
+          "a DELETE or UPDATE through a CTE names the table in the CTE's FROM" + PIN)
+    check(lint(S("WITH d AS (SELECT code FROM dbo.Lookup) DELETE FROM d;",
+                 "INSERT INTO dbo.Lookup (code) SELECT code FROM dbo.Staging;")) == [("R1", 1)],
+          "a DELETE through a CTE then an INSERT into its base table is R1" + PIN)
+    check(writes("WITH d AS (SELECT * FROM (SELECT 1 AS x) q) DELETE FROM d") == [("DELETE", "d")]
+          and writes("WITH d AS (SELECT 1 AS x) DELETE FROM d") == [("DELETE", "d")]
+          and writes("WITH d AS (SELECT x FROM d) DELETE FROM d") == [("DELETE", "d")]
+          and writes("WITH d (a) AS (SELECT a FROM dbo.Lookup) DELETE FROM d")
+          == [("DELETE", "d")]
+          and writes("INSERT INTO a (x) VALUES (1) DELETE FROM t")
+          == [("INSERT", "a"), ("DELETE", "t")]
+          and writes("SELECT 1) DELETE FROM t") == [("DELETE", "t")],
+          "a CTE with no readable base table, a cycle, a column list, an unmatched ) and a plain "
+          "DELETE keep the name")
     check(kinds("CREATE OR ALTER PROCEDURE p AS SELECT 1").count("module") == 1
           and kinds("ALTER FUNCTION f() RETURNS int AS BEGIN RETURN 1 END").count("module") == 1
           and kinds("CREATE TRIGGER t ON x AFTER INSERT AS SELECT 1").count("module") == 1
@@ -1356,6 +1441,21 @@ def _run_checks(check, raises, tmp):
           and lint(S("DELETE FROM dbo.AuditLog;", purge, note)) == [("R1", 1)]
           and lint(S("TRUNCATE TABLE dbo.AuditLog;", note)) == [("R1", 1)],
           "an equality on today, a key test, a delete of every row and a truncate are still R1")
+    recent = "DELETE FROM dbo.Lookup WHERE LoadDate %s DATEADD(DAY, -1, GETDATE());"
+    refill = "INSERT INTO dbo.Lookup (code, LoadDate) SELECT code, LoadDate FROM dbo.Staging;"
+    check(lint(S(recent % ">", refill)) == [("R1", 1)]
+          and lint(S(recent % ">=", refill)) == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.Lookup WHERE DATEDIFF(DAY, LoadDate, GETDATE()) < 1;",
+                     refill)) == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.Lookup WHERE LoadDate <> GETDATE();", refill))
+          == [("R1", 1)],
+          "a delete of the recent window is a refill, so a later INSERT is R1" + PIN)
+    check(lint(S("DELETE FROM dbo.Lookup WHERE DATEADD(DAY, -90, GETDATE()) > LoadDate;",
+                 refill)) == []
+          and lint(S("DELETE FROM dbo.Lookup WHERE Region = 1 AND LoadDate <= GETDATE() - 90;",
+                     refill)) == []
+          and lint(S("DELETE FROM dbo.Lookup WHERE LoadDate < @cutoff;", refill)) == [("R1", 1)],
+          "the date function on the old side of < or >, joined by AND, still marks a purge")
     check(lint(S("TRUNCATE TABLE dbo.Lookup;", "INSERT INTO dbo.Lookup SELECT 1;"))
           == [("R1", 1)],
           "a bare TRUNCATE then an INSERT is R1")

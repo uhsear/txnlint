@@ -26,9 +26,12 @@ PASS  a GO line inside a multi-line string is text, not a batch break  <-- pinne
 ...
 PASS  a DELETE or UPDATE through an alias names the table behind the alias  <-- pinned defect
 ...
+PASS  a DELETE or UPDATE through a CTE names the table in the CTE's FROM  <-- pinned defect
+...
 PASS  a write straight after SET ... ON, with no semicolon, is still a statement  <-- pinned defect
 ...
 PASS  a bare DELETE then an INSERT into the same table is R1
+PASS  a delete of the recent window is a refill, so a later INSERT is R1  <-- pinned defect
 ...
 PASS  a ROLLBACK in an early-exit branch does not end the transaction for the code after it  <-- pinned defect
 ...
@@ -70,10 +73,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-221 assertions, 0 failed
+226 assertions, 0 failed
 ```
 
-The full run prints all 221 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 226 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -263,9 +266,11 @@ Each statement outside a transaction is committed or rolled back when it complet
 is permanent before the `INSERT` starts. A run-time error rolls back only the statement that failed.
 A `TRUNCATE TABLE` can be rolled back, but only inside a transaction. Fix: put both statements
 between `BEGIN TRANSACTION` and `COMMIT`. A purge of old rows is not a refill and is not reported: a `DELETE` whose
-`WHERE` clause holds a date function and a `<` or `>`, such as `WHERE LogDate < DATEADD(DAY, -90, GETDATE())`, may be
-followed by an `INSERT` into the same table (a log line, say) with no finding. Equality on today's date, a key test, a
-`DELETE` with no `WHERE` and every `TRUNCATE` are still paired. A `DELETE` inside a transaction is reported too when that
+`WHERE` clause tests a date function against a cut-off in the past, such as `WHERE LogDate < DATEADD(DAY, -90, GETDATE())`
+or `WHERE DATEDIFF(DAY, LogDate, GETDATE()) > 90`, may be followed by an `INSERT` into the same table (a log line, say)
+with no finding. The date function must sit on the right of a `<` or on the left of a `>`. A delete of the recent window,
+such as `WHERE LoadDate > DATEADD(DAY, -1, GETDATE())`, removes the newest rows and is still paired. Equality on today's
+date, a key test, a `DELETE` with no `WHERE` and every `TRUNCATE` are still paired. A `DELETE` inside a transaction is reported too when that
 transaction is committed before the `INSERT` runs, in a later batch or in a second transaction: the rows are
 gone by then, and a failed `INSERT` leaves the table empty. An `INSERT` in the same transaction as the `DELETE`
 is the safe refill and is not reported, and neither is a `DELETE` that the transaction rolls back. A `MERGE`
@@ -434,7 +439,7 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A write straight after `SET ... ON` is a statement even with no semicolon | "a write straight after SET ... ON", "a bare pair straight after SET ... ON", "R2 counts writes that follow SET XACT_ABORT ON" |
 | A sqlcmd `$(variable)` is part of a name | "a sqlcmd $(variable) is part of a name", "a table named through a sqlcmd variable" |
 | A `BEGIN TRANSACTION` under an `IF` or `WHILE` does not count, unless the condition reads `@@TRANCOUNT` or `XACT_STATE()` | "a BEGIN TRANSACTION that an IF or WHILE governs", "IF @@TRANCOUNT = 0 BEGIN TRANSACTION, the XACT_STATE() form and a plain block", "an ELSE with no IF before it" |
-| R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs", "a purge of old rows by date is not a refill", "an equality on today, a key test, a delete of every row and a truncate are still R1" |
+| R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs", "a purge of old rows by date is not a refill", "a delete of the recent window is a refill", "the date function on the old side of < or >", "an equality on today, a key test, a delete of every row and a truncate are still R1" |
 | R1 reports a `MERGE` with a `THEN INSERT` as a refill, and a `DELETE` that commits in its own transaction before the `INSERT`, and spares the safe shapes | "a MERGE with WHEN NOT MATCHED THEN INSERT refills the table like an INSERT", "a MERGE with no INSERT clause is no refill", "a DELETE committed in its own transaction, then an INSERT in a later one", "a rolled back delete, a refill in the same transaction, scratch tables, nested transactions and another table are not R1" |
 | A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
@@ -452,7 +457,7 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A script whose file name starts with `=`, `+`, `-` or `@` gets a guarded `path` in the CSV and an unguarded console line, through the real command line | four assertions "a script named equals", "plus", "minus" and "at" |
 | The tool reads no CSV, so there is nothing to strip on read | "outside the self-test the tool has no csv reader" |
 | `--out` writes only with `--apply`, and never over an input | "--out without --apply writes nothing", "--out with --apply writes the header", "--out naming an input script is refused" |
-| A prefix of any long flag is refused with 64 | seven assertions, "a unique prefix --ap", "--app", "--appl", "--ou", "--unc", "--rule", "--self", and "--ap next to --out writes nothing" |
+| A prefix of any long flag is refused with 64 | eight assertions, "a unique prefix --ap", "--app", "--appl", "--ou", "--unc", "--rule", "--self", and "--ap next to --out writes nothing" |
 | UTF-16, UTF-8 with a byte order mark and cp1252 scripts are read | "UTF-16 either way round", "a UTF-16 script with a byte order mark", "a broken UTF-16 file exits 2" |
 | A file with a NUL in its text (UTF-16 with no byte order mark, or UTF-32) exits 2 and is never reported clean | "UTF-16 without a BOM is refused", "UTF-32 with a BOM is refused", "UTF-16 without a BOM file exits 2", "UTF-32 file exits 2" |
 | A folder run and the exit codes 0, 1, 2, 3 and 64 | "a folder is walked in sorted order", "a folder that cannot be listed exits 2", "a folder with no .sql file exits 2", "a file that cannot be read exits 2", "a report that cannot be written exits 2", "no path is a usage error" |
@@ -464,10 +469,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1191 statements and 496 branches, measured with
+- Branch coverage is 100 percent: 1245 statements and 528 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 221 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 226 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.12.10 and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain.
@@ -545,8 +550,9 @@ to anything else. It prints the rule text with table names and, for R6, the name
   read, the tool cannot tell. It then reports `DELETE FROM dbo.Lookup` with `INSERT INTO OtherDb.dbo.Lookup`, so that
   a refill is never missed. A `USE` in a file that you run after another one is not carried over.
 - A `THROW` in a `CATCH` block that sits inside an outer `TRY` is still counted as an R5 guard, although it jumps to the outer `CATCH`.
-- A `DELETE` through a CTE name (`WITH c AS (...) DELETE FROM c`) is read as a delete of `c`, so it does not pair
-  with an `INSERT` into the base table.
+- A `DELETE` or `UPDATE` through a CTE (`WITH c AS (SELECT ... FROM dbo.t) DELETE FROM c`) is read as a write to the
+  first table in the CTE's `FROM`. A CTE that joins two tables reads as the first one. A CTE written with a column list
+  (`WITH c (a, b) AS`) is not seen through, and is read as a write to `c`.
 - R5 counts only `INSERT`, `UPDATE`, `DELETE`, `MERGE` and `TRUNCATE` as writes. A later batch that only runs `EXEC` of a
   procedure, DDL (`ALTER`, `DROP`, `CREATE`) or `SELECT ... INTO` is not reported.
 - Only a procedure named `sp_executesql` is read as dynamic SQL, bracket-quoted or not (`EXEC [dbo].[sp_executesql] N'...'`
@@ -594,9 +600,9 @@ to anything else. It prints the rule text with table names and, for R6, the name
   with one exception: a purge by age is spared (see R1). A `DELETE` that removes a slice of rows by a key, such as
   `WHERE BatchId = @id`, is paired with a later `INSERT`, because it may be the first half of a refill.
 - R1 knows a purge only by its `WHERE` clause: a date function (`GETDATE`, `GETUTCDATE`, `SYSDATETIME`,
-  `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD` or `DATEDIFF`) and a `<` or `>`. A cut-off held
-  in a variable (`WHERE LogDate < @cutoff`) is not seen and is still paired. A refill of a recent window, such as
-  `WHERE LoadDate >= DATEADD(DAY, -1, GETDATE())` then an `INSERT` of that window, reads as a purge and is not reported.
+  `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD` or `DATEDIFF`) on the old side of a `<` or `>`,
+  that is on the right of `<` or on the left of `>`. A cut-off held in a variable (`WHERE LogDate < @cutoff`) is not seen
+  and is still paired. Each `AND` or `OR` condition is judged by its first `<` or `>`, and `<>` is never a purge.
 - R1 reads a `COMMIT` as committing the `DELETE` even when the `COMMIT` is conditional, such as `IF @@TRANCOUNT > 0 COMMIT`.
 - R5 reads any `THROW` or `RAISERROR` in a `CATCH` block as a re-raise, even one under an `IF`. A `CATCH` that raises
   again only on some paths hides the guard in its `TRY` from R5.
@@ -629,6 +635,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - Write the report outside the folder you scan, or give it a name that does not end in `.sql`. A report named
   `d/rep.sql` inside a scanned folder `d` is read as a script by the next run and counted as an extra file. Only the
   exact inputs of the current run are refused.
+- `--self-test` ignores every other argument, so `--self-test --out x.csv --apply` runs the assertions and writes nothing.
 - The demo scripts are printed in this README only. Create them by hand to repeat the sample runs.
 - Messages start with fixed tool text (a verb, a rule phrase, `EXEC`), so in practice only `path` can start with a
   formula character: a hostile folder argument or a file named on the command line. The guard on `message` is a second layer.
