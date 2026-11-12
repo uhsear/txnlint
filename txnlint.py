@@ -59,8 +59,8 @@ ALL_RULES = ("R1", "R2", "R3", "R5", "R6")
 PIN = "  <-- pinned defect"
 
 Tok = collections.namedtuple("Tok", "kind val u line batch")
-Ev = collections.namedtuple("Ev", "kind line batch name extra ctx ref")
-Ev.__new__.__defaults__ = (None,)
+Ev = collections.namedtuple("Ev", "kind line batch name extra ctx ref purge")
+Ev.__new__.__defaults__ = (None, False)
 Finding = collections.namedtuple("Finding", "path line batch rule message")
 
 _EOF = Tok("e", "", "", 0, 0)
@@ -319,6 +319,27 @@ def is_statement_start(toks, k):
     if t.u == "TRUNCATE":
         return nxt.u == "TABLE"
     return True
+
+
+_NOW_WORDS = frozenset(["GETDATE", "GETUTCDATE", "SYSDATETIME", "SYSUTCDATETIME",
+                        "SYSDATETIMEOFFSET", "CURRENT_TIMESTAMP", "DATEADD", "DATEDIFF"])
+
+
+def is_purge(toks, k):
+    """True when the DELETE at k removes rows by age: a WHERE with a date function and < or >.
+
+    A purge of old rows is not a refill, so R1 does not pair it with a later INSERT.
+    shortcut: a cut-off held in a variable or a column is not seen, and a window such as
+    LoadDate >= DATEADD(DAY, -1, GETDATE()) reads as a purge. Name the date function in
+    the WHERE clause to mark a purge, or lint the refill form without it.
+    """
+    j = k + 1
+    end = simple_end(toks, k)
+    while j < end and toks[j].u != "WHERE":
+        j += 1
+    rest = toks[j:end]
+    return any(t.u in _NOW_WORDS for t in rest) and any(
+        t.kind == "p" and t.val in "<>" for t in rest)
 
 
 def merge_inserts(toks, k):
@@ -666,6 +687,8 @@ def scan(toks):
         elif t.u in _WRITES and is_statement_start(toks, k):
             target = write_target(toks, k)
             add("write", target, t.u, state_guards(toks, k, stack))
+            if t.u == "DELETE" and is_purge(toks, k):
+                evs[-1] = evs[-1]._replace(purge=True)
             if t.u == "MERGE" and merge_inserts(toks, k):
                 add("refill", target, t.u)
     # ROLLBACK TRAN name undoes only part of a transaction when name is a savepoint.
@@ -763,6 +786,8 @@ def rule_r1(evs):
         if e.kind not in ("write", "refill") or not e.name:
             continue
         if e.kind == "write" and e.extra in ("DELETE", "TRUNCATE") and not is_scratch(e.name):
+            if e.purge:
+                continue
             if in_tran:
                 held.append((e, db))
                 ended = None
@@ -1316,6 +1341,21 @@ def _run_checks(check, raises, tmp):
     # ---- R1: a destructive statement that commits alone, then an insert
     check(lint(PAIR) == [("R1", 1)],
           "a bare DELETE then an INSERT into the same table is R1")
+    purge = "DELETE FROM dbo.AuditLog WHERE LogDate < DATEADD(DAY, -90, GETDATE());"
+    note = "INSERT INTO dbo.AuditLog (LogDate, Msg) VALUES (GETDATE(), N'run started');"
+    check(lint(S(purge, "GO", note, "GO")) == []
+          and lint(S(purge, note)) == []
+          and lint(S("DELETE FROM dbo.AuditLog WHERE DATEDIFF(DAY, LogDate, @now) > 90", note)) == []
+          and lint(S("BEGIN TRAN;", purge, "COMMIT;", "GO", note)) == []
+          and lint(S("BEGIN TRAN;", purge, note, "COMMIT;")) == [],
+          "a purge of old rows by date is not a refill, so a later INSERT is not R1"
+          + PIN)
+    check(lint(S("DELETE FROM dbo.AuditLog WHERE LogDate = CAST(GETDATE() AS date);", note))
+          == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.AuditLog WHERE BatchId < @n;", note)) == [("R1", 1)]
+          and lint(S("DELETE FROM dbo.AuditLog;", purge, note)) == [("R1", 1)]
+          and lint(S("TRUNCATE TABLE dbo.AuditLog;", note)) == [("R1", 1)],
+          "an equality on today, a key test, a delete of every row and a truncate are still R1")
     check(lint(S("TRUNCATE TABLE dbo.Lookup;", "INSERT INTO dbo.Lookup SELECT 1;"))
           == [("R1", 1)],
           "a bare TRUNCATE then an INSERT is R1")

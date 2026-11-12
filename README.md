@@ -70,10 +70,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-219 assertions, 0 failed
+221 assertions, 0 failed
 ```
 
-The full run prints all 219 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 221 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -262,7 +262,10 @@ the first four rules stay as they are, so a later rule can take R4 without renum
 Each statement outside a transaction is committed or rolled back when it completes, so the `DELETE`
 is permanent before the `INSERT` starts. A run-time error rolls back only the statement that failed.
 A `TRUNCATE TABLE` can be rolled back, but only inside a transaction. Fix: put both statements
-between `BEGIN TRANSACTION` and `COMMIT`. A `DELETE` inside a transaction is reported too when that
+between `BEGIN TRANSACTION` and `COMMIT`. A purge of old rows is not a refill and is not reported: a `DELETE` whose
+`WHERE` clause holds a date function and a `<` or `>`, such as `WHERE LogDate < DATEADD(DAY, -90, GETDATE())`, may be
+followed by an `INSERT` into the same table (a log line, say) with no finding. Equality on today's date, a key test, a
+`DELETE` with no `WHERE` and every `TRUNCATE` are still paired. A `DELETE` inside a transaction is reported too when that
 transaction is committed before the `INSERT` runs, in a later batch or in a second transaction: the rows are
 gone by then, and a failed `INSERT` leaves the table empty. An `INSERT` in the same transaction as the `DELETE`
 is the safe refill and is not reported, and neither is a `DELETE` that the transaction rolls back. A `MERGE`
@@ -431,7 +434,7 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | A write straight after `SET ... ON` is a statement even with no semicolon | "a write straight after SET ... ON", "a bare pair straight after SET ... ON", "R2 counts writes that follow SET XACT_ABORT ON" |
 | A sqlcmd `$(variable)` is part of a name | "a sqlcmd $(variable) is part of a name", "a table named through a sqlcmd variable" |
 | A `BEGIN TRANSACTION` under an `IF` or `WHILE` does not count, unless the condition reads `@@TRANCOUNT` or `XACT_STATE()` | "a BEGIN TRANSACTION that an IF or WHILE governs", "IF @@TRANCOUNT = 0 BEGIN TRANSACTION, the XACT_STATE() form and a plain block", "an ELSE with no IF before it" |
-| R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs" |
+| R1 reports a bare pair, across batches, through an alias, and not inside a transaction | "a bare DELETE then an INSERT", "a bare TRUNCATE", "the same pair inside BEGIN TRANSACTION", "a DELETE in one batch and its INSERT in the next", "R1 sees a DELETE written through an alias", "a transaction opened before GO", "after ROLLBACK", "one COMMIT of two nested", "one DELETE followed by two INSERTs", "a purge of old rows by date is not a refill", "an equality on today, a key test, a delete of every row and a truncate are still R1" |
 | R1 reports a `MERGE` with a `THEN INSERT` as a refill, and a `DELETE` that commits in its own transaction before the `INSERT`, and spares the safe shapes | "a MERGE with WHEN NOT MATCHED THEN INSERT refills the table like an INSERT", "a MERGE with no INSERT clause is no refill", "a DELETE committed in its own transaction, then an INSERT in a later one", "a rolled back delete, a refill in the same transaction, scratch tables, nested transactions and another table are not R1" |
 | A conditional `ROLLBACK` that exits keeps the transaction open, and any other one ends it | "a ROLLBACK in an early-exit branch", "a ROLLBACK under IF, ELSE or WHILE with no exit", "a ROLLBACK branch that ends in THROW, GOTO or an unconditional RETURN", "a ROLLBACK that nothing makes conditional", "a nested condition is skipped whole", "the search for an IF stops" |
 | R1, R2 and R3 respect implicit transactions and savepoints | "with implicit transactions on" (three assertions), "ROLLBACK to a savepoint leaves the transaction open", "a ROLLBACK to a savepoint does not count" |
@@ -461,10 +464,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1175 statements and 490 branches, measured with
+- Branch coverage is 100 percent: 1191 statements and 496 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 219 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 221 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.12.10 and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain.
@@ -587,8 +590,13 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - The only procedure calls that give a note are those after an unprotected `DELETE` or `TRUNCATE`, and those in a
   `CATCH` block before its `ROLLBACK`. A procedure that deletes and refills inside its own body is another script.
   Lint that script on its own. A procedure that writes after an unwrapped `UPDATE` is not seen.
-- R1 pairs every committed `DELETE` with every later `INSERT` into the same table, whatever the `WHERE` clause says.
-  A purge of old rows followed by an unrelated `INSERT` into the same table is reported.
+- R1 pairs every committed `DELETE` with every later `INSERT` into the same table, whatever the `WHERE` clause says,
+  with one exception: a purge by age is spared (see R1). A `DELETE` that removes a slice of rows by a key, such as
+  `WHERE BatchId = @id`, is paired with a later `INSERT`, because it may be the first half of a refill.
+- R1 knows a purge only by its `WHERE` clause: a date function (`GETDATE`, `GETUTCDATE`, `SYSDATETIME`,
+  `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD` or `DATEDIFF`) and a `<` or `>`. A cut-off held
+  in a variable (`WHERE LogDate < @cutoff`) is not seen and is still paired. A refill of a recent window, such as
+  `WHERE LoadDate >= DATEADD(DAY, -1, GETDATE())` then an `INSERT` of that window, reads as a purge and is not reported.
 - R1 reads a `COMMIT` as committing the `DELETE` even when the `COMMIT` is conditional, such as `IF @@TRANCOUNT > 0 COMMIT`.
 - R5 reads any `THROW` or `RAISERROR` in a `CATCH` block as a re-raise, even one under an `IF`. A `CATCH` that raises
   again only on some paths hides the guard in its `TRY` from R5.
