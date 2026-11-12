@@ -26,11 +26,12 @@ PASS  a GO line inside a multi-line string is text, not a batch break  <-- pinne
 ...
 PASS  a DELETE or UPDATE through an alias names the table behind the alias  <-- pinned defect
 ...
-PASS  a DELETE or UPDATE through a CTE names the table in the CTE's FROM  <-- pinned defect
-...
 PASS  a write straight after SET ... ON, with no semicolon, is still a statement  <-- pinned defect
 ...
+PASS  a DELETE or UPDATE through a CTE names the table in the CTE's FROM  <-- pinned defect
+...
 PASS  a bare DELETE then an INSERT into the same table is R1
+...
 PASS  a delete of the recent window is a refill, so a later INSERT is R1  <-- pinned defect
 ...
 PASS  a ROLLBACK in an early-exit branch does not end the transaction for the code after it  <-- pinned defect
@@ -456,7 +457,7 @@ symbolic-link limits, were also run once by hand on Linux. They are noted under 
 | Text that does not start with one of them, and a number, is not changed | "text that does not start with a formula character, and a number, pass through unchanged" |
 | A script whose file name starts with `=`, `+`, `-` or `@` gets a guarded `path` in the CSV and an unguarded console line, through the real command line | four assertions "a script named equals", "plus", "minus" and "at" |
 | The tool reads no CSV, so there is nothing to strip on read | "outside the self-test the tool has no csv reader" |
-| `--out` writes only with `--apply`, and never over an input | "--out without --apply writes nothing", "--out with --apply writes the header", "--out naming an input script is refused" |
+| `--out` writes only with `--apply`, and never over an input path that resolves to the same file (a hard link is not detected, see Limits) | "--out without --apply writes nothing", "--out with --apply writes the header", "--out naming an input script is refused" |
 | A prefix of any long flag is refused with 64 | eight assertions, "a unique prefix --ap", "--app", "--appl", "--ou", "--unc", "--rule", "--self", and "--ap next to --out writes nothing" |
 | UTF-16, UTF-8 with a byte order mark and cp1252 scripts are read | "UTF-16 either way round", "a UTF-16 script with a byte order mark", "a broken UTF-16 file exits 2" |
 | A file with a NUL in its text (UTF-16 with no byte order mark, or UTF-32) exits 2 and is never reported clean | "UTF-16 without a BOM is refused", "UTF-32 with a BOM is refused", "UTF-16 without a BOM file exits 2", "UTF-32 file exits 2" |
