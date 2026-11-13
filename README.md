@@ -74,10 +74,10 @@ PASS  and raises() accepts the ValueError it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-227 assertions, 0 failed
+229 assertions, 0 failed
 ```
 
-The full run prints all 227 assertions. Each `...` line is where this block is cut. A line marked
+The full run prints all 229 assertions. Each `...` line is where this block is cut. A line marked
 `<-- pinned defect` guards a case that an earlier draft of this tool, or an earlier version of its
 own test, got wrong. Bugs found in review are pinned the same way.
 
@@ -227,8 +227,9 @@ wrote findings.csv
 
 Some code cannot be read. `EXEC (@stmt)` runs a string that the tool does not see, and `:r` pulls in another
 file. When such code may hide a write, the tool prints a note. If it found nothing else, it exits with 3
-instead of 0. A clean result never covers an `EXEC` of a string or a `:r` that it could not read. It does not read a
-procedure body either, so a bare `EXEC dbo.usp_reload;` is clean (see Limits).
+instead of 0. A clean result never covers an `EXEC` of a string or a `:r` that it could not read. It does not read the
+body of a procedure that the file does not define, so a bare `EXEC dbo.usp_reload;` with no unprotected `DELETE` or
+`TRUNCATE` before it is clean, and exits 0 (see Limits).
 
 For a file `dynamic.sql` that holds only `EXEC (@stmt);`:
 
@@ -254,7 +255,7 @@ $ echo $?
 The parser does not accept abbreviations. `--ap` is refused with exit code 64, and it writes nothing,
 even next to `--out`. Argparse would otherwise read `--ap` as `--apply`.
 
-`--out` may not name a file that the same run reads, by any path that resolves to that same file. The tool refuses,
+`--out` may not name a file that the same run reads, even through a symbolic link, or on Windows a different letter case. The tool refuses,
 so a typo cannot overwrite a script. A hard link to an input is not detected (see Limits).
 
 ## The rules
@@ -470,10 +471,10 @@ to anything else. It prints the rule text with table names and, for R6, the name
 
 ## Measured
 
-- Branch coverage is 100 percent: 1248 statements and 530 branches, measured with
+- Branch coverage is 100 percent: 1250 statements and 530 branches, measured with
   `coverage run --branch txnlint.py --self-test` on Windows Python 3.13.2.
 - `pyflakes` is clean. `python -W error` compiles the file and runs the whole self-test without a warning.
-- The self-test prints 227 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
+- The self-test prints 229 assertions with 0 failed on every interpreter I ran in this round: Python 3.9.25,
   3.12.10 and 3.13.2 on Windows, and Python 3.9.25, 3.11.16 and 3.12.3 on Linux (run with `python3 -W error`). The
   output text of the Windows 3.13.2 run and the Linux run is the same once Windows' carriage returns are
   removed, so there is no difference to explain.
@@ -497,8 +498,8 @@ to anything else. It prints the rule text with table names and, for R6, the name
   instead of a clean pass; `ln victim.sql hl.sql` followed by `--out hl.sql --apply` overwrites `victim.sql`
   with the CSV (listed under Limits); a subfolder reached only through a symbolic link, in a folder that holds nothing else, gives exit 2, and a
   symbolic link beside a real folder is not followed. A symbolic link given directly as the path argument is followed and linted.
-- The self-test writes only inside its own temporary folder and removes it. It leaves nothing in the
-  working directory.
+- The self-test writes only inside its own temporary folder and tries to remove it. A failed removal is silent, so
+  a locked temporary folder can stay behind. It leaves nothing in the working directory.
 - The file is pure ASCII and has no f-string. Python 3.9 runs it.
 
 ## Exit codes
@@ -520,6 +521,11 @@ to anything else. It prints the rule text with table names and, for R6, the name
   that R6 looks inside every string literal. The tool prints a note for such a string when it may hold a
   write, and for every `:r` line. Lint an included file on its own. A `CATCH` block that calls a logging
   procedure with `EXEC` before the `ROLLBACK` gives a note, not a finding, because the procedure body is not read.
+- A procedure that the file does not define is not read. A bare `EXEC dbo.usp_reload;` with no unprotected `DELETE` or
+  `TRUNCATE` before it and outside a `CATCH` block gives no note and exit 0, because without such a delete the file
+  holds no gap for the rules to measure. A note on every `EXEC` of a procedure would make most real scripts exit 3.
+  R1 and R2 do read a procedure body that sits in the same file.
+- A transaction that is opened and never committed or rolled back before the end of the file lints clean. No rule covers it.
 - It reads a script from top to bottom. Both branches of an `IF ... ELSE` count as one run, and a loop body
   counts once. A `DELETE` in one branch and an `INSERT` in the other is reported by R1.
 - It cannot know who calls a procedure. R1 and R2 read a procedure body as if nothing wraps it. A
@@ -620,6 +626,7 @@ to anything else. It prints the rule text with table names and, for R6, the name
 - A subfolder that is reached only through a symbolic link is not followed, and its `.sql` files are skipped without a message.
   The exit code does not warn about it, so a folder run can exit 0 without having read every script.
   A folder that holds only such a link exits 2 with `no .sql file found`.
+- The comparison under "What already exists" and the `gh search` result are dated 2026-10-13 and will go stale.
 - The fuzz and mutation drivers are not shipped, so the 20,000-program run, the 425 and 437 mutation sweeps and the seven R1/R5 and six formula-guard mutations in Measured cannot be repeated from this repository.
 - The timings in this section depend on the machine and were taken with generator scripts that are not shipped. Treat them as orders of magnitude, not promises.
 - One audit run of a 300 KB file with 30,000 nested `BEGIN` blocks exited 1 after 48.9 seconds with empty output. Two reruns exited 0 and I did not reproduce the exit 1. An exit 1 with no output is not a verdict, so treat it as a failed run and run again.

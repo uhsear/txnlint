@@ -2085,6 +2085,11 @@ def _run_checks(check, raises, tmp):
           and notes("EXEC sp_executesql") == [] and notes("EXEC('SELECT ' + 'x')") == []
           and notes("EXEC('DELETE FROM t'); :r a.sql", ("R6",)) == [],
           "a procedure call, a harmless string and a run with only R6 list nothing")
+    check(gate(*analyse("EXEC dbo.usp_reload;")) == 0
+          and gate(*analyse(S("EXEC dbo.usp_reload;", "GO"))) == 0,
+          "a lone EXEC of a procedure with no unprotected delete before it exits 0 (a named limit)")
+    check(gate(*analyse(S("BEGIN TRANSACTION;", "DELETE FROM dbo.A;"))) == 0,
+          "a transaction never closed before end of file lints clean (a named limit)")
     check(notes("EXEC (N'DE' + N'LETE FROM dbo.Lookup');") == [(1, "EXEC")]
           and notes("EXEC ('UPD' + 'ATE t SET a = 1' + '')") == [(1, "EXEC")]
           and notes("EXEC sp_executesql N'DE' + N'LETE FROM dbo.t';") == [(1, "SP_EXECUTESQL")]
